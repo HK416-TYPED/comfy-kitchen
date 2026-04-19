@@ -106,6 +106,12 @@ set(CUDA_SOURCES
     ops/quantize_mxfp8.cu
     ops/cublas_gemm_nvfp4.cu
     ops/apply_rope.cu
+    # nunchaku zgemm verbatim port — W4A4 path only. See ops/zgemm/README.md
+    # for attribution and scope. Instantiations for bf16/fp16 int4 are each
+    # in their own .cu so template expansion stays parallel.
+    ops/zgemm/gemm_w4a4.cu
+    ops/zgemm/gemm_w4a4_launch_bf16_int4.cu
+    ops/zgemm/gemm_w4a4_launch_fp16_int4.cu
 )
 
 set(CPP_SOURCES
