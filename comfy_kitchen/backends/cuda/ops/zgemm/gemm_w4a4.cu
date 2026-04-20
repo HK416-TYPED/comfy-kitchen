@@ -16,18 +16,27 @@ struct FasterI2FMode {
 
 template<typename F>
 static void invoke_launch(Tensor::ScalarType dtype, bool use_fp4, bool fasterI2F, F &&launch) {
-    if (fasterI2F && dtype == Tensor::FP16) {
-        launch.template operator()<GEMMConfig_W4A4_FP16_FasterI2F, false>();
+    // KITCHEN PATCH: FP4 path + FasterI2F path are both disabled.
+    //   * FP4 is out of scope for Level 1 (W4A4 only). Keeping the original
+    //     `dispatchBool(use_fp4, ...)` would instantiate `USE_FP4=true` and
+    //     force us to vendor `gemm_w4a4_launch_{bf16,fp16}_fp4.cu`.
+    //   * FasterI2F is a sm_75 (Turing) optimization only — `FasterI2FMode::
+    //     check` already returns false on every non-sm_75 device, so the
+    //     runtime branch is never taken on our RTX 5090/Ada target, but
+    //     leaving `GEMMConfig_W4A4_FP16_FasterI2F` in the dispatch would
+    //     require vendoring `gemm_w4a4_launch_fp16_int4_fasteri2f.cu`.
+    if (use_fp4) {
+        throw std::runtime_error("kitchen zgemm port: FP4 path is disabled (W4A4 only)");
+    }
+    if (fasterI2F) {
+        throw std::runtime_error("kitchen zgemm port: FasterI2F path is disabled (sm_75-only)");
+    }
+    if (dtype == Tensor::FP16) {
+        launch.template operator()<GEMMConfig_W4A4_FP16, false>();
+    } else if (dtype == Tensor::BF16) {
+        launch.template operator()<GEMMConfig_W4A4_BF16, false>();
     } else {
-        dispatchBool(use_fp4, [&]<bool USE_FP4>() {
-            if (dtype == Tensor::FP16) {
-                launch.template operator()<GEMMConfig_W4A4_FP16, USE_FP4>();
-            } else if (dtype == Tensor::BF16) {
-                launch.template operator()<GEMMConfig_W4A4_BF16, USE_FP4>();
-            } else {
-                assert(false);
-            }
-        });
+        assert(false);
     }
 }
 

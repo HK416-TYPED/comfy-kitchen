@@ -23,6 +23,9 @@
 
 namespace nb = nanobind;
 
+// Defined in ops/zgemm/zgemm_bridge.cpp.
+extern void register_zgemm_bindings(nb::module_ &m);
+
 // Helper: Map nanobind dtype to internal dtype code
 // Returns: 0=float32, 1=float16, 2=bfloat16, 3=uint8, 4=int8, 5=float8_e4m3fn, 6=float8_e5m2
 int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
@@ -552,6 +555,9 @@ NB_MODULE(_C, m) {
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();
+
+    // nunchaku zgemm W4A4 verbatim port (see ops/zgemm/zgemm_bridge.cpp).
+    register_zgemm_bindings(m);
 
     // Add version info
     m.attr("__version__") = "0.1.0";

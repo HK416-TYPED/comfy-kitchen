@@ -24,6 +24,7 @@ __all__ = [
     "apply_rope1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "nunchaku_svdquant_linear",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
@@ -482,6 +483,107 @@ def apply_rope(
     )
 
     return xq_out, xk_out
+
+
+# ---------------------------------------------------------------------------
+# SVDQuant W4A4 — verbatim nunchaku zgemm path (tile-packed layout only).
+# Kitchen-native row-major kernels live on feat/svdquant-w4a4-kitchen-native;
+# this branch ships only the verbatim nunchaku port.
+# ---------------------------------------------------------------------------
+
+def nunchaku_svdquant_linear(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    proj_down: torch.Tensor,
+    proj_up: torch.Tensor,
+    smooth: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    act_unsigned: bool = False,
+    pad_size: int = 256,
+) -> torch.Tensor:
+    """SVDQuant W4A4 linear using the verbatim nunchaku zgemm kernel path.
+
+    Single-call wrapper over the `nunchaku_quantize_w4a4_act_fuse_lora` +
+    `nunchaku_gemm_w4a4` bridge. The GEMM kernel applies LoRA-up and bias
+    inside its epilogue (no Python addmm after), so output includes them.
+
+    All weight tensors must be in nunchaku tile-packed layout (that is the
+    only layout the zgemm kernel accepts). Checkpoints produced by the
+    `split_fused_qkv.py` converter already live in this layout; the comfy_quant
+    metadata will carry `"layout": "nunchaku_zgemm_tile_packed"` to route here.
+
+    Parameters
+    ----------
+    x            (M, K)         bf16/fp16
+    qweight      (N, K/2)       int8, packed int4 (tile-packed along N)
+    wscales      (K/G, N)       bf16/fp16, tile-packed
+    proj_down    (K, R)         bf16/fp16, tile-packed (LoRA down)
+    proj_up      (N, R)         bf16/fp16, tile-packed (LoRA up)
+    smooth       (K,)           bf16/fp16, tile-packed (smooth-quant input scale)
+    bias         (N,) or None   bf16/fp16, tile-packed
+    act_unsigned bool           true for post-GELU layers (img_mlp.net.2 etc.)
+    pad_size     int            M padding granularity (256 = nunchaku default)
+
+    Returns
+    -------
+    out          (M, N)         bf16/fp16 (= wscales.dtype)
+    """
+    if _C is None:
+        raise RuntimeError("comfy_kitchen CUDA extension not available; cannot run nunchaku zgemm path")
+
+    M, K = x.shape
+    N = qweight.shape[0]
+    R = proj_down.shape[1]
+    G = 64
+    assert K % G == 0, f"K={K} not divisible by group size {G}"
+    assert qweight.shape[1] * 2 == K, f"qweight K-dim mismatch: {qweight.shape[1]}*2 != {K}"
+
+    M_pad = roundup(M, pad_size)
+    dtype = wscales.dtype
+    device = x.device
+
+    # Packed activation buffers — same shapes as nunchaku's
+    # svdq_quantize_w4a4_act_fuse_lora_cuda allocates.
+    q_x      = torch.empty(M_pad, K // 2, dtype=torch.uint8, device=device)
+    ascales  = torch.empty(K // G, M_pad, dtype=dtype,       device=device)
+    lora_act = torch.empty(M_pad, R,      dtype=torch.float32, device=device)
+    out      = torch.empty(M_pad, N,      dtype=dtype,       device=device)
+
+    stream_ptr = torch.cuda.current_stream(device).cuda_stream
+
+    _C.nunchaku_quantize_w4a4_act_fuse_lora(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(q_x),
+        _wrap_for_dlpack(ascales),
+        _wrap_for_dlpack(proj_down),
+        _wrap_for_dlpack(lora_act),
+        _wrap_for_dlpack(smooth),
+        False,  # fuse_glu — only used in the FF.net.0 GEGLU path, which we
+                # treat as two separate linears at the model level
+        False,  # fp4 — disabled in kitchen port
+        stream_ptr,
+    )
+
+    _C.nunchaku_gemm_w4a4(
+        _wrap_for_dlpack(q_x),
+        _wrap_for_dlpack(qweight),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(ascales),
+        _wrap_for_dlpack(wscales),
+        _wrap_for_dlpack(lora_act),
+        _wrap_for_dlpack(proj_up),
+        _wrap_for_dlpack(bias) if bias is not None else None,
+        None, None, None, None, None,  # no fused next-layer quantize
+        act_unsigned,
+        False,                         # fuse_silu
+        [1.0] * ((R + 15) // 16),
+        stream_ptr,
+    )
+
+    return out[:M] if M_pad != M else out
+
 
 
 def _build_constraints() -> dict:

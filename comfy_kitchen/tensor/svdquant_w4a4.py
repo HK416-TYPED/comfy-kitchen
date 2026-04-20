@@ -57,6 +57,12 @@ class TensorCoreSVDQuantW4A4Layout(QuantizedLayout):
     # quantize an incoming float activation.
     QUANTIZES_INPUT = False
 
+    # Physical byte layout of the five weight-family tensors. This branch is
+    # the verbatim nunchaku zgemm port — the only supported value is
+    # "nunchaku_zgemm_tile_packed". The row-major variant lives on
+    # feat/svdquant-w4a4-kitchen-native.
+    LAYOUT_NUNCHAKU_ZGEMM_TILE_PACKED = "nunchaku_zgemm_tile_packed"
+
     @dataclass(frozen=True)
     class Params(BaseLayoutParams):
         """SVDQuant W4A4 parameters.
@@ -65,12 +71,16 @@ class TensorCoreSVDQuantW4A4Layout(QuantizedLayout):
         BaseLayoutParams. Adds the three tensors that parameterize the
         low-rank correction and input smoothing, plus a logical-transpose flag
         used by the aten.t / aten.mm dispatch path.
+
+        `layout` tags the weight byte layout for cross-branch compatibility;
+        this branch only consumes `"nunchaku_zgemm_tile_packed"`.
         """
         proj_down: torch.Tensor
         proj_up: torch.Tensor
         smooth_factor: torch.Tensor
         act_unsigned: bool = False
         transposed: bool = False
+        layout: str = "nunchaku_zgemm_tile_packed"
 
         def _tensor_fields(self) -> list[str]:
             return ["scale", "proj_down", "proj_up", "smooth_factor"]
@@ -146,27 +156,39 @@ def _w4a4_forward(
     weight_qt: "QuantizedTensor",
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Compute y = x @ W^T + bias via nunchaku's fused int4 kernel."""
+    """Compute y = x @ W^T + bias via the verbatim nunchaku zgemm kernel.
+
+    Nunchaku's fused quantize-LoRA kernel feeds the same input (shifted for
+    act_unsigned layers, e.g. post-GELU fc2) to both the int4 quantize branch
+    and the LoRA-down branch — we match that math here rather than splitting
+    LoRA onto un-shifted activations as the kitchen row-major backend does.
+    Only the tile-packed layout is supported on this branch.
+    """
+    from comfy_kitchen.backends.cuda import nunchaku_svdquant_linear
+
     qdata, wscales, smooth, proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
-    act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
+    params = weight_qt._params
+    act_unsigned = bool(getattr(params, "act_unsigned", False))
+    layout = getattr(params, "layout", TensorCoreSVDQuantW4A4Layout.LAYOUT_NUNCHAKU_ZGEMM_TILE_PACKED)
+    if layout != TensorCoreSVDQuantW4A4Layout.LAYOUT_NUNCHAKU_ZGEMM_TILE_PACKED:
+        raise NotImplementedError(
+            f"feat/nunchaku-verbatim-replica only supports layout="
+            f"{TensorCoreSVDQuantW4A4Layout.LAYOUT_NUNCHAKU_ZGEMM_TILE_PACKED!r}; "
+            f"got {layout!r}. Use feat/svdquant-w4a4-kitchen-native for the "
+            f"row-major path."
+        )
 
     orig_shape = input_tensor.shape
     x2d = input_tensor.reshape(-1, orig_shape[-1])
     M = x2d.shape[0]
-
-    q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
-        x2d,
-        smooth=smooth,
-        lora_down=proj_down,
-        act_unsigned=act_unsigned,
-        shift_value=_GELU_UNSIGNED_SHIFT if act_unsigned else 0.0,
-    )
-    out = ck.scaled_mm_svdquant_w4a4(
-        act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
-        lora_act_in=lora_act, lora_up=proj_up, bias=bias,
-        act_unsigned=act_unsigned,
-    )
     out_features = qdata.shape[0]
+
+    x_main = x2d + _GELU_UNSIGNED_SHIFT if act_unsigned else x2d
+    out = nunchaku_svdquant_linear(
+        x=x_main, qweight=qdata, wscales=wscales,
+        proj_down=proj_down, proj_up=proj_up, smooth=smooth,
+        bias=bias, act_unsigned=act_unsigned,
+    )
     return out[:M].reshape(*orig_shape[:-1], out_features)
 
 

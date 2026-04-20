@@ -116,6 +116,7 @@ set(CUDA_SOURCES
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
+    ops/zgemm/zgemm_bridge.cpp
 )
 
 # Create the nanobind module

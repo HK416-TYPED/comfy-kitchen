@@ -34,7 +34,9 @@ ported.
 
 ## Local patches
 
-Minimal, confined to `common.h`:
+Patches are minimal and limited to two files:
+
+**`common.h`**:
 
 - **spdlog** is replaced with no-op inline stubs in a local `namespace spdlog`.
   All call sites (`spdlog::trace(fmt, args...)`) compile away to nothing.
@@ -46,9 +48,24 @@ Minimal, confined to `common.h`:
   downstream translation units have the half2 / bfloat162 types available
   regardless of include order.
 
-Everything else — all kernel code in `gemm_*.cu*`, `lora.cuh`, `mma*.cuh`,
-`epilogues.cuh`, `utils.cuh`, `Tensor.h`, `dispatch_utils.h` — is byte-identical
-to the upstream revision.
+**`gemm_w4a4.cu`** (`invoke_launch` only):
+
+- The `dispatchBool(use_fp4, ...)` call and the `fasterI2F && dtype==FP16`
+  branch are both removed. Reasons:
+  - `dispatchBool` compiles both `USE_FP4` template branches regardless of
+    runtime value, which would require vendoring
+    `gemm_w4a4_launch_{bf16,fp16}_fp4.cu`. FP4 is out of scope for Level 1
+    (W4A4 only).
+  - `FasterI2F` is a sm_75 (Turing) optimization only — `FasterI2FMode::check`
+    returns false on every other device, so the runtime branch is never
+    taken on the RTX 5090/Ada target. Keeping it would require vendoring
+    `gemm_w4a4_launch_fp16_int4_fasteri2f.cu`.
+  Both paths now throw if called; callers on the W4A4 path pass `fp4=false`
+  and the runtime check turns FasterI2F off for non-sm_75.
+
+Everything else — all kernel code in `gemm_*.cu*` (except the `invoke_launch`
+patch above), `lora.cuh`, `mma*.cuh`, `epilogues.cuh`, `utils.cuh`, `Tensor.h`,
+`dispatch_utils.h` — is byte-identical to the upstream revision.
 
 ## Integration
 
