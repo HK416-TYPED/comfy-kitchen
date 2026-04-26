@@ -162,6 +162,21 @@ extern "C" {
         int act_unsigned,
         int out_dtype_code,
         cudaStream_t stream);
+
+    // AWQ W4A16 — see ops/awq_w4a16.cu. Internal M-routing picks
+    // gemv (M ≤ 8) vs gemm path; bias / LoRA-up are applied externally.
+    void launch_awq_w4a16_kernel(
+        const void* x,
+        const void* qweight,
+        const void* wscales,
+        const void* wzeros,
+        void* out,
+        int M,
+        int N,
+        int K,
+        int G,
+        int dtype_code,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -574,6 +589,31 @@ void svdquant_scaled_mm_w4a4(
         static_cast<int>(act_unsigned), out_code, stream);
 }
 
+// ---------------------------------------------------------------------------
+// AWQ W4A16 — int4 weight, fp16/bf16 activation matmul. See ops/awq_w4a16.cu.
+// ---------------------------------------------------------------------------
+void awq_w4a16(
+    nb::ndarray<nb::device::cuda> x,         // (M, K) bf16/fp16
+    nb::ndarray<nb::device::cuda> qweight,   // (N, K/2) int8 packed uint4
+    nb::ndarray<nb::device::cuda> wscales,   // (K/G, N)
+    nb::ndarray<nb::device::cuda> wzeros,    // (K/G, N)
+    nb::ndarray<nb::device::cuda> out,       // (M, N)
+    int group_size,
+    uintptr_t stream_ptr)
+{
+    const int M = static_cast<int>(x.shape(0));
+    const int K = static_cast<int>(x.shape(1));
+    const int N = static_cast<int>(qweight.shape(0));
+    const int dtype_code = svdquant_dtype_code(x.dtype());
+    if (dtype_code != 1 && dtype_code != 2) {
+        throw std::runtime_error("awq_w4a16: only fp16 (1) and bf16 (2) activations supported");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_awq_w4a16_kernel(
+        x.data(), qweight.data(), wscales.data(), wzeros.data(), out.data(),
+        M, N, K, group_size, dtype_code, stream);
+}
+
 // Python module definition
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
@@ -672,6 +712,18 @@ NB_MODULE(_C, m) {
           nb::arg("bias"),
           nb::arg("out"),
           nb::arg("act_unsigned"),
+          nb::arg("stream_ptr"));
+
+    m.def("awq_w4a16", &awq_w4a16,
+          "AWQ W4A16: int4 weight @ fp activation (kitchen-native row-major). "
+          "Internal M-routing picks gemv (M ≤ 8) vs gemm. bias / LoRA-up are "
+          "applied externally; this kernel only does the dequant + matmul.",
+          nb::arg("x"),
+          nb::arg("qweight"),
+          nb::arg("wscales"),
+          nb::arg("wzeros"),
+          nb::arg("out"),
+          nb::arg("group_size"),
           nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)
