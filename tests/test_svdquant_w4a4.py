@@ -23,8 +23,7 @@ from comfy_kitchen.backends.eager.svdquant import (
     _unpack_uint4_row_major,
 )
 
-from .conftest import assert_values_close, get_capable_backends
-
+from .conftest import assert_values_close
 
 _GROUP = 64
 
@@ -52,10 +51,10 @@ class TestQuantizerClampContract:
     def test_signed_clamp_normal_and_extreme(self, cuda_available, seed, scale_factor):
         if not cuda_available:
             pytest.skip("CUDA required for scaled_mm dispatch")
-        K = 128
-        x = torch.randn(4, K, dtype=torch.bfloat16, device="cuda") * scale_factor
-        smooth = torch.ones(K, dtype=torch.bfloat16, device="cuda")
-        lora_down = torch.zeros(K, 16, dtype=torch.bfloat16, device="cuda")
+        k = 128
+        x = torch.randn(4, k, dtype=torch.bfloat16, device="cuda") * scale_factor
+        smooth = torch.ones(k, dtype=torch.bfloat16, device="cuda")
+        lora_down = torch.zeros(k, 16, dtype=torch.bfloat16, device="cuda")
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
@@ -74,11 +73,11 @@ class TestQuantizerClampContract:
         """
         if not cuda_available:
             pytest.skip("CUDA required for scaled_mm dispatch")
-        K = 128
-        x = torch.randn(4, K, dtype=torch.bfloat16, device="cuda") * 5.0
+        k = 128
+        x = torch.randn(4, k, dtype=torch.bfloat16, device="cuda") * 5.0
         x[0, 0] = -100.0  # forces negative saturation
-        smooth = torch.ones(K, dtype=torch.bfloat16, device="cuda")
-        lora_down = torch.zeros(K, 16, dtype=torch.bfloat16, device="cuda")
+        smooth = torch.ones(k, dtype=torch.bfloat16, device="cuda")
+        lora_down = torch.zeros(k, 16, dtype=torch.bfloat16, device="cuda")
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
@@ -93,10 +92,10 @@ class TestQuantizerClampContract:
         """Bulk test across many samples."""
         if not cuda_available:
             pytest.skip("CUDA required for scaled_mm dispatch")
-        K = 128
-        x = torch.randn(256, K, dtype=torch.bfloat16, device="cuda") * 3.0
-        smooth = torch.ones(K, dtype=torch.bfloat16, device="cuda")
-        lora_down = torch.zeros(K, 16, dtype=torch.bfloat16, device="cuda")
+        k = 128
+        x = torch.randn(256, k, dtype=torch.bfloat16, device="cuda") * 3.0
+        smooth = torch.ones(k, dtype=torch.bfloat16, device="cuda")
+        lora_down = torch.zeros(k, 16, dtype=torch.bfloat16, device="cuda")
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
@@ -110,11 +109,11 @@ class TestQuantizerClampContract:
         """Unsigned path: emission must be in [0, 15]."""
         if not cuda_available:
             pytest.skip("CUDA required for scaled_mm dispatch")
-        K = 128
+        k = 128
         # Non-negative input (simulates post-GELU + shift)
-        x = torch.rand(4, K, dtype=torch.bfloat16, device="cuda") * 3.0 + 0.01
-        smooth = torch.ones(K, dtype=torch.bfloat16, device="cuda")
-        lora_down = torch.zeros(K, 16, dtype=torch.bfloat16, device="cuda")
+        x = torch.rand(4, k, dtype=torch.bfloat16, device="cuda") * 3.0 + 0.01
+        smooth = torch.ones(k, dtype=torch.bfloat16, device="cuda")
+        lora_down = torch.zeros(k, 16, dtype=torch.bfloat16, device="cuda")
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
@@ -147,14 +146,14 @@ class TestActUnsignedDispatch:
             pytest.skip("CUDA required for int4 MMA kernels")
 
     def _run(self, act_unsigned):
-        M, N, K, R = 16, 8, 64, 16
-        q_act = torch.full((M, K // 2), 0xFF, dtype=torch.uint8, device="cuda").view(torch.int8)
-        q_wgt = torch.full((N, K // 2), 0x11, dtype=torch.int8, device="cuda")  # two s4=1 per byte
-        asc = torch.ones(K // 64, M, dtype=torch.bfloat16, device="cuda")
-        wsc = torch.ones(K // 64, N, dtype=torch.bfloat16, device="cuda")
-        lai = torch.zeros(M, R, dtype=torch.float32, device="cuda")
-        lu = torch.zeros(N, R, dtype=torch.bfloat16, device="cuda")
-        b = torch.zeros(N, dtype=torch.bfloat16, device="cuda")
+        m, n, k, r = 16, 8, 64, 16
+        q_act = torch.full((m, k // 2), 0xFF, dtype=torch.uint8, device="cuda").view(torch.int8)
+        q_wgt = torch.full((n, k // 2), 0x11, dtype=torch.int8, device="cuda")  # two s4=1 per byte
+        asc = torch.ones(k // 64, m, dtype=torch.bfloat16, device="cuda")
+        wsc = torch.ones(k // 64, n, dtype=torch.bfloat16, device="cuda")
+        lai = torch.zeros(m, r, dtype=torch.float32, device="cuda")
+        lu = torch.zeros(n, r, dtype=torch.bfloat16, device="cuda")
+        b = torch.zeros(n, dtype=torch.bfloat16, device="cuda")
         with ck.use_backend("cuda"):
             return ck.scaled_mm_svdquant_w4a4(
                 act=q_act, wgt=q_wgt, ascales=asc, wscales=wsc,
@@ -202,10 +201,10 @@ class TestLoraXSeparation:
         elif device != "cuda":
             pytest.skip(f"backend {backend} needs cuda")
 
-        K, R = 128, 16
-        x = torch.randn(4, K, dtype=torch.bfloat16, device=device)
-        smooth = torch.ones(K, dtype=torch.bfloat16, device=device)
-        lora_down = torch.randn(K, R, dtype=torch.bfloat16, device=device) * 0.1
+        k, r = 128, 16
+        x = torch.randn(4, k, dtype=torch.bfloat16, device=device)
+        smooth = torch.ones(k, dtype=torch.bfloat16, device=device)
+        lora_down = torch.randn(k, r, dtype=torch.bfloat16, device=device) * 0.1
 
         with ck.use_backend(backend):
             q1, asc1, la1 = ck.quantize_svdquant_w4a4(x, smooth, lora_down, pad_size=16)
@@ -233,11 +232,11 @@ class TestLoraXSeparation:
         if backend != "eager" and device != "cuda":
             pytest.skip(f"backend {backend} needs cuda")
 
-        K, R = 128, 16
-        raw_x = torch.randn(4, K, dtype=torch.bfloat16, device=device) * 0.5
+        k, r = 128, 16
+        raw_x = torch.randn(4, k, dtype=torch.bfloat16, device=device) * 0.5
         shifted_x = raw_x + 0.171875
-        smooth = torch.ones(K, dtype=torch.bfloat16, device=device)
-        lora_down = torch.randn(K, R, dtype=torch.bfloat16, device=device) * 0.1
+        smooth = torch.ones(k, dtype=torch.bfloat16, device=device)
+        lora_down = torch.randn(k, r, dtype=torch.bfloat16, device=device) * 0.1
 
         with ck.use_backend(backend):
             # Correct: pre-shifted for main, raw for lora
@@ -276,22 +275,22 @@ class TestSvdquantSmoke:
     reasonable outputs on matched random data (not a nunchaku bit-parity test —
     that's an integration concern)."""
 
-    @pytest.mark.parametrize("M,N,K,R", [
+    @pytest.mark.parametrize("m,n,k,r", [
         (16, 8, 64, 16),     # one MMA
         (64, 32, 128, 16),
         (256, 128, 512, 32),
     ])
-    def test_signed_forward_runs(self, cuda_available, seed, M, N, K, R):
+    def test_signed_forward_runs(self, cuda_available, seed, m, n, k, r):
         if not cuda_available:
             pytest.skip("CUDA required")
         device = "cuda"
-        x = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.3
-        smooth = torch.ones(K, dtype=torch.bfloat16, device=device) * 1.0
-        proj_down = torch.randn(K, R, dtype=torch.bfloat16, device=device) * 0.05
-        proj_up = torch.randn(N, R, dtype=torch.bfloat16, device=device) * 0.05
-        wscales = torch.rand(K // _GROUP, N, dtype=torch.bfloat16, device=device) * 0.5 + 0.1
+        x = torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.3
+        smooth = torch.ones(k, dtype=torch.bfloat16, device=device) * 1.0
+        proj_down = torch.randn(k, r, dtype=torch.bfloat16, device=device) * 0.05
+        proj_up = torch.randn(n, r, dtype=torch.bfloat16, device=device) * 0.05
+        wscales = torch.rand(k // _GROUP, n, dtype=torch.bfloat16, device=device) * 0.5 + 0.1
         # Signed wgt in [-7, 7]
-        wgt_int = torch.randint(-7, 8, (N, K), dtype=torch.int8, device=device)
+        wgt_int = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
         lo = wgt_int[..., 0::2].to(torch.int32) & 0x0F
         hi = wgt_int[..., 1::2].to(torch.int32) & 0x0F
         wgt = (lo | (hi << 4)).to(torch.int8)
@@ -302,6 +301,6 @@ class TestSvdquantSmoke:
                 act=q_act, wgt=wgt, ascales=asc, wscales=wscales,
                 lora_act_in=la, lora_up=proj_up,
             )
-        assert out.shape[0] >= M  # padded to pad_size
-        assert out.shape[1] == N
+        assert out.shape[0] >= m  # padded to pad_size
+        assert out.shape[1] == n
         assert torch.isfinite(out).all()

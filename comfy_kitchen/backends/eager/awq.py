@@ -54,28 +54,28 @@ def gemv_awq_w4a16(
     """
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1])
-    M, K = x2d.shape
-    if K % group_size != 0:
-        raise ValueError(f"K={K} not divisible by group_size={group_size}")
+    _m, k = x2d.shape
+    if k % group_size != 0:
+        raise ValueError(f"K={k} not divisible by group_size={group_size}")
 
-    N, K_half = qweight.shape
-    if K_half * 2 != K:
-        raise ValueError(f"qweight K//2={K_half} inconsistent with x K={K}")
+    n, k_half = qweight.shape
+    if k_half * 2 != k:
+        raise ValueError(f"qweight K//2={k_half} inconsistent with x K={k}")
 
     compute_dtype = wscales.dtype
 
     # Dequantize: (qweight - 8) * wscales + wzeros
-    w_uint = _unpack_uint4_row_major(qweight).to(compute_dtype)  # (N, K)
-    w_groups = w_uint.view(N, K // group_size, group_size)
-    # wscales / wzeros are (K/G, N) — transpose to (N, K/G) for broadcasting
-    scales_ng = wscales.t().unsqueeze(-1)  # (N, K/G, 1)
+    w_uint = _unpack_uint4_row_major(qweight).to(compute_dtype)  # (n, k)
+    w_groups = w_uint.view(n, k // group_size, group_size)
+    # wscales / wzeros are (K/G, N) — transpose to (n, k/g) for broadcasting
+    scales_ng = wscales.t().unsqueeze(-1)  # (n, k/g, 1)
     zeros_ng = wzeros.t().unsqueeze(-1)
-    w_fp = ((w_groups - 8.0) * scales_ng + zeros_ng).view(N, K)
+    w_fp = ((w_groups - 8.0) * scales_ng + zeros_ng).view(n, k)
 
     out = x2d.to(compute_dtype) @ w_fp.t()
     if bias is not None:
         out = out + bias
-    return out.reshape(*orig_shape[:-1], N)
+    return out.reshape(*orig_shape[:-1], n)
 
 
 # =============================================================================

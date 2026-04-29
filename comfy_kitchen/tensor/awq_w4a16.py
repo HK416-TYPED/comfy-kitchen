@@ -95,24 +95,24 @@ class TensorCoreAWQW4A16Layout(QuantizedLayout):
         quantized matmul (e.g. RHS is not transposed, or operand types don't
         match). Stays in fp accumulation on the eager backend.
         """
-        N, K_half = qdata.shape
-        K = K_half * 2
-        G = params.group_size
+        n, k_half = qdata.shape
+        k = k_half * 2
+        g = params.group_size
         # Unpack two uint4 nibbles per byte: bits 0..3 -> col 2j, bits 4..7 -> col 2j+1
         q_i32 = qdata.to(torch.int32)
         lo = (q_i32 & 0x0F).to(torch.int32)
         hi = ((q_i32 >> 4) & 0x0F).to(torch.int32)
-        w_uint = torch.empty(N, K, dtype=torch.int32, device=qdata.device)
+        w_uint = torch.empty(n, k, dtype=torch.int32, device=qdata.device)
         w_uint[:, 0::2] = lo
         w_uint[:, 1::2] = hi
-        scales = params.scale.t().unsqueeze(-1)   # (N, K/G, 1)
+        scales = params.scale.t().unsqueeze(-1)   # (n, k/g, 1)
         zeros  = params.zeros.t().unsqueeze(-1)
-        groups = w_uint.view(N, K // G, G).to(params.orig_dtype)
-        w = ((groups - 8.0) * scales + zeros).view(N, K)
+        groups = w_uint.view(n, k // g, g).to(params.orig_dtype)
+        w = ((groups - 8.0) * scales + zeros).view(n, k)
         return w
 
     @classmethod
-    def get_plain_tensors(cls, qtensor: "QuantizedTensor"):
+    def get_plain_tensors(cls, qtensor: QuantizedTensor):
         p = qtensor._params
         return qtensor._qdata, p.scale, p.zeros
 
@@ -129,7 +129,7 @@ class TensorCoreAWQW4A16Layout(QuantizedLayout):
 
 def _awq_forward(
     input_tensor: torch.Tensor,
-    weight_qt: "QuantizedTensor",
+    weight_qt: QuantizedTensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
     """Compute y = x @ W^T + bias via AWQ W4A16 GEMV."""
@@ -162,7 +162,7 @@ def _handle_awq_t(qt, args, kwargs):
     return QuantizedTensor(input_tensor._qdata, "TensorCoreAWQW4A16Layout", new_params)
 
 
-def _resolve_awq_rhs(rhs: "QuantizedTensor") -> "QuantizedTensor":
+def _resolve_awq_rhs(rhs: QuantizedTensor) -> QuantizedTensor:
     """Return rhs unchanged if it is logically transposed (represents W^T)."""
     if not rhs._params.transposed:
         raise RuntimeError(

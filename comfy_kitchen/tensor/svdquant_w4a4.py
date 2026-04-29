@@ -104,7 +104,7 @@ class TensorCoreSVDQuantW4A4Layout(QuantizedLayout):
         this path stays bit-exact with the actual compute path regardless of
         per-group scaling / LoRA composition details.
         """
-        out_features, _ = qdata.shape
+        _out_features, _ = qdata.shape
         in_features = params.orig_shape[1]
         device = qdata.device
         dtype = params.orig_dtype
@@ -147,7 +147,7 @@ class TensorCoreSVDQuantW4A4Layout(QuantizedLayout):
 
 def _w4a4_forward(
     input_tensor: torch.Tensor,
-    weight_qt: "QuantizedTensor",
+    weight_qt: QuantizedTensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
     """Compute y = x @ W^T + bias via the int4 kernel.
@@ -167,7 +167,7 @@ def _w4a4_forward(
 
     orig_shape = input_tensor.shape
     x2d = input_tensor.reshape(-1, orig_shape[-1])
-    M = x2d.shape[0]
+    m = x2d.shape[0]
 
     if act_unsigned:
         x_main = x2d + _GELU_UNSIGNED_SHIFT  # fed to quantize for unsigned grid
@@ -189,7 +189,7 @@ def _w4a4_forward(
         act_unsigned=act_unsigned,
     )
     out_features = qdata.shape[0]
-    return out[:M].reshape(*orig_shape[:-1], out_features)
+    return out[:m].reshape(*orig_shape[:-1], out_features)
 
 
 @register_layout_op(torch.ops.aten.t.default, TensorCoreSVDQuantW4A4Layout)
@@ -216,7 +216,7 @@ def _handle_w4a4_t(qt, args, kwargs):
     return QuantizedTensor(input_tensor._qdata, "TensorCoreSVDQuantW4A4Layout", new_params)
 
 
-def _resolve_svdquant_rhs(rhs: "QuantizedTensor") -> "QuantizedTensor":
+def _resolve_svdquant_rhs(rhs: QuantizedTensor) -> QuantizedTensor:
     """Return rhs unchanged if it is logically transposed (represents W^T)."""
     if not rhs._params.transposed:
         raise RuntimeError(

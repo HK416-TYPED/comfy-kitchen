@@ -43,10 +43,9 @@
 #       + x @ proj_down @ proj_up.T
 #       + bias
 
-import math
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 
 _INT4_GROUP_SIZE = 64
 # Quantizer emission ranges (not the same as the 4-bit storage range — see
@@ -141,23 +140,23 @@ def quantize_svdquant_w4a4(
     """
     if x.dim() != 2:
         raise ValueError(f"expected 2D input, got shape {tuple(x.shape)}")
-    M, K = x.shape
-    rank = lora_down.shape[1]
+    m, k = x.shape
+    lora_down.shape[1]
     group = _INT4_GROUP_SIZE
-    if K % group != 0:
-        raise ValueError(f"K={K} not divisible by group_size={group}")
-    M_pad = _ceil_div(M, pad_size) * pad_size
+    if k % group != 0:
+        raise ValueError(f"K={k} not divisible by group_size={group}")
+    m_pad = _ceil_div(m, pad_size) * pad_size
 
     # LoRA down uses un-shifted, un-smoothed activation (SVDQuant invariant).
     lora_src = lora_x if lora_x is not None else x
-    lora_act = lora_src.float() @ lora_down.float()  # (M, R)
+    lora_act = lora_src.float() @ lora_down.float()  # (m, r)
 
     # Smooth (divide) + per-row per-group int4 quantization.
     # SmoothQuant: outliers are moved from activations to weights at calibration.
     # At inference, activations divide by smooth so they quantize cleanly.
     x_smooth = x / smooth
-    groups = x_smooth.view(M, K // group, group)
-    absmax = groups.abs().amax(dim=-1).clamp(min=1e-10)  # (M, K/G)
+    groups = x_smooth.view(m, k // group, group)
+    absmax = groups.abs().amax(dim=-1).clamp(min=1e-10)  # (m, k/g)
     # Quantizer emission range: symmetric signed [-7, 7] or unsigned [0, 15].
     # Signed clamp intentionally does NOT reach -8 even though the nibble can
     # represent it — absmax/7 scaling assumes ±qmax symmetry and emitting -8
@@ -166,16 +165,16 @@ def quantize_svdquant_w4a4(
     qmin = 0 if act_unsigned else -_INT4_MAX
     scales = absmax / qmax
     q_vals = (groups / scales.unsqueeze(-1)).round().clamp(qmin, qmax).to(torch.int8)
-    q_vals = q_vals.reshape(M, K)
-    q_packed = _pack_int4_row_major(q_vals)  # (M, K // 2)
+    q_vals = q_vals.reshape(m, k)
+    q_packed = _pack_int4_row_major(q_vals)  # (m, k // 2)
 
-    if M_pad > M:
-        pad = M_pad - M
+    if m_pad > m:
+        pad = m_pad - m
         q_packed = F.pad(q_packed, (0, 0, 0, pad))
         scales = F.pad(scales, (0, 0, 0, pad))
         lora_act = F.pad(lora_act, (0, 0, 0, pad))
 
-    ascales = scales.t().contiguous().to(x.dtype)  # (K/G, M_pad)
+    ascales = scales.t().contiguous().to(x.dtype)  # (k/g, m_pad)
     return q_packed, ascales, lora_act
 
 
@@ -219,31 +218,28 @@ def scaled_mm_svdquant_w4a4(
     Returns:
         out: (M, N) in the dtype of wscales/lora_up.
     """
-    M, K_half = act.shape
-    N = wgt.shape[0]
-    K = K_half * 2
+    m, k_half = act.shape
+    n = wgt.shape[0]
+    k = k_half * 2
     group = _INT4_GROUP_SIZE
     compute_dtype = wscales.dtype
 
     # --- weight dequantization ---
-    wgt_int = _unpack_int4_row_major(wgt).to(compute_dtype)  # (N, K)
-    wgt_g = wgt_int.view(N, K // group, group)
-    wscales_bng = wscales.t().unsqueeze(-1)  # (N, K/G, 1)
-    wgt_fp = (wgt_g * wscales_bng).view(N, K)
+    wgt_int = _unpack_int4_row_major(wgt).to(compute_dtype)  # (n, k)
+    wgt_g = wgt_int.view(n, k // group, group)
+    wscales_bng = wscales.t().unsqueeze(-1)  # (n, k/g, 1)
+    wgt_fp = (wgt_g * wscales_bng).view(n, k)
 
     # --- activation dequantization ---
-    if act_unsigned:
-        act_int = _unpack_uint4_row_major(act)
-    else:
-        act_int = _unpack_int4_row_major(act)
-    act_int = act_int.to(compute_dtype).view(M, K // group, group)
-    ascales_mng = ascales.t().unsqueeze(-1)  # (M, K/G, 1)
-    act_fp = (act_int * ascales_mng).view(M, K)
+    act_int = _unpack_uint4_row_major(act) if act_unsigned else _unpack_int4_row_major(act)
+    act_int = act_int.to(compute_dtype).view(m, k // group, group)
+    ascales_mng = ascales.t().unsqueeze(-1)  # (m, k/g, 1)
+    act_fp = (act_int * ascales_mng).view(m, k)
 
-    out = act_fp @ wgt_fp.t()  # (M, N)
+    out = act_fp @ wgt_fp.t()  # (m, n)
 
     # LoRA up branch (in fp32 for accumulation stability)
-    lora_contribution = lora_act_in.float() @ lora_up.float().t()  # (M, N)
+    lora_contribution = lora_act_in.float() @ lora_up.float().t()  # (m, n)
     out = out + lora_contribution.to(out.dtype)
 
     if bias is not None:
@@ -287,12 +283,12 @@ def _op_quantize_svdquant_w4a4(
 def _op_quantize_svdquant_w4a4_fake(
     x, smooth, lora_down, pad_size=256, act_unsigned=False, lora_x=None,
 ):
-    M, K = x.shape
-    R = lora_down.shape[1]
-    M_pad = _ceil_div(M, pad_size) * pad_size
-    q_x = torch.empty(M_pad, K // 2, dtype=torch.int8, device=x.device)
-    ascales = torch.empty(K // _INT4_GROUP_SIZE, M_pad, dtype=x.dtype, device=x.device)
-    lora_act = torch.empty(M_pad, R, dtype=torch.float32, device=x.device)
+    m, k = x.shape
+    r = lora_down.shape[1]
+    m_pad = _ceil_div(m, pad_size) * pad_size
+    q_x = torch.empty(m_pad, k // 2, dtype=torch.int8, device=x.device)
+    ascales = torch.empty(k // _INT4_GROUP_SIZE, m_pad, dtype=x.dtype, device=x.device)
+    lora_act = torch.empty(m_pad, r, dtype=torch.float32, device=x.device)
     return q_x, ascales, lora_act
 
 
@@ -322,6 +318,6 @@ def _op_scaled_mm_svdquant_w4a4(
 def _op_scaled_mm_svdquant_w4a4_fake(
     act, wgt, ascales, wscales, lora_act_in, lora_up, bias=None, act_unsigned=False,
 ):
-    M = act.shape[0]
-    N = wgt.shape[0]
-    return torch.empty(M, N, dtype=lora_up.dtype, device=act.device)
+    m = act.shape[0]
+    n = wgt.shape[0]
+    return torch.empty(m, n, dtype=lora_up.dtype, device=act.device)
