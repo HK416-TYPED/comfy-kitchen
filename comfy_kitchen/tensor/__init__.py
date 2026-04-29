@@ -1,4 +1,5 @@
 """Quantized tensor types with typed layout parameters."""
+from .awq_w4a16 import TensorCoreAWQW4A16Layout
 from .base import (
     BaseLayoutParams,
     QuantizedLayout,
@@ -9,7 +10,6 @@ from .base import (
     register_layout_class,
     register_layout_op,
 )
-from .awq_w4a16 import TensorCoreAWQW4A16Layout
 from .fp8 import TensorCoreFP8Layout
 from .mxfp8 import TensorCoreMXFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout

@@ -264,7 +264,7 @@ def quantize_svdquant_w4a4(
         (quantized_x uint8 [M_pad, K//2], ascales [K//64, M_pad], lora_act fp32 [M_pad, R])
 
     Note: the returned lora_act is a fp32 buffer, but under the CUDA backend it
-    carries bf16-matmul precision (the output of a bf16 × bf16 torch matmul
+    carries bf16-matmul precision (the output of a bf16 x bf16 torch matmul
     upcast to fp32), not fp32-accumulated precision. The eager backend runs the
     LoRA matmul in fp32 for numerical stability, which makes it a high-precision
     reference rather than a bit-parity oracle for the CUDA path.

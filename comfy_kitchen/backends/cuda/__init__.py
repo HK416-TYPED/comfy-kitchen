@@ -524,15 +524,15 @@ def quantize_svdquant_w4a4(
     x was pre-shifted (LoRA operates on pre-quantization, pre-shift activations).
     """
     assert x.dim() == 2 and x.is_contiguous(), "x must be 2D contiguous"
-    M, K = x.shape
-    R = lora_down.shape[1]
-    M_pad = roundup(M, pad_size)
-    G = _SVDQUANT_W4A4_GROUP_SIZE
-    assert K % G == 0, f"K={K} must be divisible by group_size={G}"
+    m, k = x.shape
+    r = lora_down.shape[1]
+    m_pad = roundup(m, pad_size)
+    g = _SVDQUANT_W4A4_GROUP_SIZE
+    assert k % g == 0, f"K={k} must be divisible by group_size={g}"
 
-    q_x = torch.empty(M_pad, K // 2, dtype=torch.uint8, device=x.device)
-    ascales = torch.empty(K // G, M_pad, dtype=x.dtype, device=x.device)
-    lora_act = torch.empty(M_pad, R, dtype=torch.float32, device=x.device)
+    q_x = torch.empty(m_pad, k // 2, dtype=torch.uint8, device=x.device)
+    ascales = torch.empty(k // g, m_pad, dtype=x.dtype, device=x.device)
+    lora_act = torch.empty(m_pad, r, dtype=torch.float32, device=x.device)
 
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
     _C.svdquant_quantize_w4a4(
@@ -554,10 +554,10 @@ def quantize_svdquant_w4a4(
     # result (~8e-3 abs error vs true fp32). Accepts lora_x to let callers keep
     # LoRA on the raw pre-quantization activation when x has been pre-shifted.
     lora_src = lora_x if lora_x is not None else x
-    if M > 0:
-        lora_act[:M].copy_(lora_src @ lora_down, non_blocking=True)
-    if M_pad > M:
-        lora_act[M:].zero_()
+    if m > 0:
+        lora_act[:m].copy_(lora_src @ lora_down, non_blocking=True)
+    if m_pad > m:
+        lora_act[m:].zero_()
     return q_x.view(torch.int8), ascales, lora_act
 
 
@@ -589,9 +589,9 @@ def scaled_mm_svdquant_w4a4(
 
     act_unsigned: if True, A fragments go through u4.s4 MMA instead of s4.s4.
     """
-    M = act.shape[0]
-    N = wgt.shape[0]
-    out = torch.empty(M, N, dtype=lora_up.dtype, device=act.device)
+    m = act.shape[0]
+    n = wgt.shape[0]
+    out = torch.empty(m, n, dtype=lora_up.dtype, device=act.device)
     empty = torch.empty(0, dtype=lora_up.dtype, device=act.device)
 
     stream_ptr = torch.cuda.current_stream(act.device).cuda_stream
@@ -628,8 +628,8 @@ def scaled_mm_svdquant_w4a4(
 # Above this M the fused MMA kernel falls behind cuBLAS bf16 GEMM on Blackwell
 # (cuBLAS approaches peak; the kernel here is single-thread-per-N-row in the
 # dequant pass and lacks cp.async pipelining). Empirically the crossover sits
-# near M=256 on RTX 5090 / Qwen-Image-Edit shapes (M=256: 1.6× vs eager,
-# M=512: 0.88×). Above the limit we route to a CUDA-side dequant +
+# near M=256 on RTX 5090 / Qwen-Image-Edit shapes (M=256: 1.6x vs eager,
+# M=512: 0.88x). Above the limit we route to a CUDA-side dequant +
 # torch.matmul (cuBLAS) path. Future tuning of the MMA kernel will raise
 # this limit and eventually remove the fallback.
 _AWQ_W4A16_MMA_M_LIMIT = 256
@@ -648,19 +648,19 @@ def _awq_w4a16_dequant_then_matmul(
     `out = x @ W.T`. Same algebra as eager.gemv_awq_w4a16 — used for M values
     where the in-kitchen MMA kernel is slower than cuBLAS bf16 GEMM.
     """
-    N, K_half = qweight.shape
-    K = K_half * 2
-    G = group_size
+    n, k_half = qweight.shape
+    k = k_half * 2
+    g = group_size
     compute_dtype = wscales.dtype
 
     x32 = qweight.to(torch.int32)
     lo = (x32 & 0xF).to(torch.int8)
     hi = ((x32 >> 4) & 0xF).to(torch.int8)
-    nibbles = torch.stack([lo, hi], dim=-1).reshape(N, K).to(compute_dtype)
+    nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(compute_dtype)
     w = (
-        (nibbles.view(N, K // G, G) - 8.0) * wscales.t().unsqueeze(-1)
+        (nibbles.view(n, k // g, g) - 8.0) * wscales.t().unsqueeze(-1)
         + wzeros.t().unsqueeze(-1)
-    ).view(N, K)
+    ).view(n, k)
     return x.matmul(w.t())
 
 
@@ -676,7 +676,7 @@ def gemv_awq_w4a16(
 
     Tiered routing:
       M ≤ 8                    naive 1-thread-per-output kernel (GEMV-style)
-      8 < M ≤ 512              fused int4 × bf16/fp16 MMA kernel — dequant
+      8 < M ≤ 512              fused int4 x bf16/fp16 MMA kernel — dequant
                                into shmem, mma.m16n8k16.f32 along K, no
                                intermediate bf16 W workspace
       M > 512                  dequant + cuBLAS bf16 matmul fallback
@@ -695,19 +695,19 @@ def gemv_awq_w4a16(
     """
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1])
-    M, K = x2d.shape
-    N = qweight.shape[0]
-    if K % group_size != 0:
-        raise ValueError(f"K={K} not divisible by group_size={group_size}")
-    if qweight.shape[1] * 2 != K:
-        raise ValueError(f"qweight K//2={qweight.shape[1]} inconsistent with x K={K}")
+    m, k = x2d.shape
+    n = qweight.shape[0]
+    if k % group_size != 0:
+        raise ValueError(f"K={k} not divisible by group_size={group_size}")
+    if qweight.shape[1] * 2 != k:
+        raise ValueError(f"qweight K//2={qweight.shape[1]} inconsistent with x K={k}")
 
-    if M > _AWQ_W4A16_MMA_M_LIMIT:
+    if m > _AWQ_W4A16_MMA_M_LIMIT:
         out2d = _awq_w4a16_dequant_then_matmul(
             x2d.contiguous().to(wscales.dtype), qweight, wscales, wzeros, group_size,
         )
     else:
-        out2d = torch.empty(M, N, dtype=wscales.dtype, device=x.device)
+        out2d = torch.empty(m, n, dtype=wscales.dtype, device=x.device)
         stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
         _C.awq_w4a16(
             _wrap_for_dlpack(x2d.contiguous().to(wscales.dtype)),
@@ -722,7 +722,7 @@ def gemv_awq_w4a16(
     if bias is not None:
         out2d.add_(bias)
 
-    return out2d.reshape(*orig_shape[:-1], N)
+    return out2d.reshape(*orig_shape[:-1], n)
 
 
 def _build_constraints() -> dict:
