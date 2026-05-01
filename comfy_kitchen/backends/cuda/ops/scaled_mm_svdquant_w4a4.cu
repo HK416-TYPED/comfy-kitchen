@@ -163,6 +163,18 @@ template<>
 struct Vec2Traits<__nv_bfloat16> {
     using Pair = __nv_bfloat162;
 
+    __device__ __forceinline__ static uint32_t to_bits(Pair v) {
+        const __nv_bfloat162_raw raw = static_cast<__nv_bfloat162_raw>(v);
+        return static_cast<uint32_t>(raw.x) | (static_cast<uint32_t>(raw.y) << 16);
+    }
+
+    __device__ __forceinline__ static Pair from_bits(uint32_t v) {
+        __nv_bfloat162_raw raw;
+        raw.x = static_cast<unsigned short>(v & 0xffffu);
+        raw.y = static_cast<unsigned short>(v >> 16);
+        return Pair(raw);
+    }
+
     __device__ __forceinline__ static Pair zero() {
         return __floats2bfloat162_rn(0.f, 0.f);
     }
@@ -180,10 +192,17 @@ struct Vec2Traits<__nv_bfloat16> {
     }
 
     __device__ __forceinline__ static Pair fma(Pair a, Pair b, Pair c) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-        return __hadd2(__hmul2(a, b), c);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        uint32_t out;
+        asm("{ fma.rn.bf16x2 %0, %1, %2, %3; }\n"
+            : "=r"(out)
+            : "r"(to_bits(a)), "r"(to_bits(b)), "r"(to_bits(c)));
+        return from_bits(out);
 #else
-        return __hfma2(a, b, c);
+        const float2 af = __bfloat1622float2(a);
+        const float2 bf = __bfloat1622float2(b);
+        const float2 cf = __bfloat1622float2(c);
+        return __floats2bfloat162_rn(af.x * bf.x + cf.x, af.y * bf.y + cf.y);
 #endif
     }
 
