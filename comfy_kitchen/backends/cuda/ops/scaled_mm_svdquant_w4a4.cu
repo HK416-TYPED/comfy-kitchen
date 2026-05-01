@@ -180,7 +180,11 @@ struct Vec2Traits<__nv_bfloat16> {
     }
 
     __device__ __forceinline__ static Pair fma(Pair a, Pair b, Pair c) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+        return __hadd2(__hmul2(a, b), c);
+#else
         return __hfma2(a, b, c);
+#endif
     }
 
     __device__ __forceinline__ static __nv_bfloat16 low(Pair v) {
