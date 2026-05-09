@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as functional
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends.eager.svdquant import (
@@ -133,7 +133,10 @@ class TestGroupedSplitQKV:
             grouped = svdquant_w4a4_grouped_linear(
                 x, weights, biases, validate_shared_quant=True,
             )
-            expected = tuple(F.linear(x, weight, bias) for weight, bias in zip(weights, biases))
+            expected = tuple(
+                functional.linear(x, weight, bias)
+                for weight, bias in zip(weights, biases, strict=True)
+            )
 
         assert len(grouped) == 3
         for idx, (actual, ref) in enumerate(zip(grouped, expected, strict=True)):
@@ -194,7 +197,10 @@ class TestGroupedSplitQKV:
 
         with ck.use_backend("eager"):
             fused = svdquant_w4a4_fused_grouped_linear(x, fused_weight, fused_bias, splits)
-            expected = tuple(F.linear(x, weight, bias) for weight, bias in zip(weights, biases))
+            expected = tuple(
+                functional.linear(x, weight, bias)
+                for weight, bias in zip(weights, biases, strict=True)
+            )
 
         for idx, (actual, ref) in enumerate(zip(fused, expected, strict=True)):
             assert_values_close(actual, ref, rtol=0.0, atol=0.0, name=f"fused qkv {idx}")
@@ -612,7 +618,7 @@ class TestSvdquantSmoke:
         cuda_was_disabled = ck.list_backends()["cuda"]["disabled"]
         ck.disable_backend("cuda")
         try:
-            out = F.linear(x, qt, bias)
+            out = functional.linear(x, qt, bias)
         finally:
             if cuda_was_disabled:
                 ck.disable_backend("cuda")
