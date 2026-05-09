@@ -44,13 +44,7 @@
 
 namespace {
 
-constexpr int kGroupSize        = 64;   // matches AWQ paper / kitchen eager
 constexpr int kGemvMThreshold   = 8;    // M ≤ 8 routes to gemv (naive) kernel
-// Above this M the per-thread MMA throughput stops keeping up with cuBLAS bf16
-// GEMM on Blackwell; the Python wrapper handles M > kMmaMUpperLimit via a
-// dequant + cuBLAS matmul fallback (see backends/cuda/__init__.py). The kernel
-// itself does not look at this limit — only the Python dispatcher does.
-constexpr int kMmaMUpperLimit   = 512;  // soft hint, exposed via Python const
 
 template<typename T>
 __device__ __forceinline__ float to_fp32(T v);
@@ -85,15 +79,6 @@ __device__ __forceinline__ uint32_t cvta_smem_u32(const void* ptr) {
 // Used for A operand of mma.m16n8k16 (16M × 16K row-major in shmem).
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&dst)[4], uint32_t addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
-                 "{%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
-                 : "r"(addr));
-}
-
-// ldmatrix.x4.trans: same shape, but the 8x8 sub-tiles are returned transposed.
-// Used for the B operand of mma.m16n8k16 when source memory is N-major.
-__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&dst)[4], uint32_t addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
                  "{%0, %1, %2, %3}, [%4];\n"
                  : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
                  : "r"(addr));

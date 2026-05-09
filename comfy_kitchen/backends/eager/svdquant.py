@@ -53,8 +53,8 @@ _TILE_PACKED_INTERLEAVE = 4
 # Quantizer emission ranges (not the same as the 4-bit storage range — see
 # module header). Symmetric absmax quantization uses scale = max/_INT4_MAX and
 # clamps to [-_INT4_MAX, +_INT4_MAX]; -8 is representable by the nibble but is
-# not emitted because it would break the dequant symmetry (nunchaku contract,
-# see /workspace/nunchaku/src/kernels/zgemm/gemm_w4a4.cuh:435).
+# not emitted because it would break the dequant symmetry used by nunchaku's
+# W4A4 kernel contract.
 _INT4_MAX = 7   # signed quantizer range: [-7, 7], scale = max/7
 _UINT4_MAX = 15 # unsigned quantizer range: [0, 15], scale = max/15 (post-GELU+shift fc2)
 _GELU_UNSIGNED_SHIFT = 0.171875  # matches nunchaku's SHIFT_GELU constant
