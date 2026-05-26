@@ -217,6 +217,7 @@ def quantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     epsilon: float = 0.0,
     pad_16x: bool = False,
+    hi_first: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # CUDA backend: uses cuBLAS tiled layout for block scales
     assert x.is_contiguous(), "Input tensor must be contiguous"
@@ -254,6 +255,7 @@ def quantize_nvfp4(
         _wrap_for_dlpack(sx_uint8),
         epsilon,
         pad_16x,
+        hi_first,
         stream_ptr,
     )
 
@@ -268,6 +270,7 @@ def dequantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     block_scales: torch.Tensor,
     output_type: torch.dtype = torch.bfloat16,
+    hi_first: bool = True,
 ) -> torch.Tensor:
     assert qx.is_contiguous(), "Input tensor must be contiguous"
 
@@ -290,6 +293,7 @@ def dequantize_nvfp4(
         _wrap_for_dlpack(block_scales_uint8),
         _wrap_for_dlpack(output),
         output_dtype_code,
+        hi_first,
         stream_ptr,
     )
 

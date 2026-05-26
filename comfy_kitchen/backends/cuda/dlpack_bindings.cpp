@@ -114,6 +114,7 @@ extern "C" {
         int64_t orig_cols,
         float epsilon,
         int input_dtype_code,
+        bool hi_first,
         cudaStream_t stream);
 
     void launch_dequantize_nvfp4_kernel(
@@ -124,6 +125,7 @@ extern "C" {
         int64_t num_rows,
         int64_t num_cols,
         int output_dtype_code,
+        bool hi_first,
         cudaStream_t stream);
 
     void launch_quantize_mxfp8_kernel(
@@ -288,6 +290,7 @@ void quantize_nvfp4(
     nb::ndarray<nb::device::cuda> block_scales,
     float epsilon,
     bool pad_16x,
+    bool hi_first,
     uintptr_t stream_ptr) {
 
     // Get input dimensions (orig_rows, orig_cols)
@@ -322,6 +325,7 @@ void quantize_nvfp4(
         orig_cols,
         epsilon,
         input_dtype_code,
+        hi_first,
         stream);
 }
 
@@ -332,6 +336,7 @@ void dequantize_nvfp4(
     nb::ndarray<nb::device::cuda> block_scales,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
     int output_dtype_code,
+    bool hi_first,
     uintptr_t stream_ptr) {
 
     // Get output dimensions (should match input logical dimensions)
@@ -352,6 +357,7 @@ void dequantize_nvfp4(
         num_rows,
         num_cols,
         output_dtype_code,
+        hi_first,
         stream);
 }
 
@@ -579,6 +585,7 @@ NB_MODULE(_C, m) {
           nb::arg("block_scales"),
           nb::arg("epsilon"),
           nb::arg("pad_16x") = false,
+          nb::arg("hi_first") = true,
           nb::arg("stream_ptr"));
 
     m.def("dequantize_nvfp4", &dequantize_nvfp4,
@@ -588,6 +595,7 @@ NB_MODULE(_C, m) {
           nb::arg("block_scales"),
           nb::arg("output"),
           nb::arg("output_dtype_code"),
+          nb::arg("hi_first") = true,
           nb::arg("stream_ptr"));
 
     m.def("quantize_mxfp8", &quantize_mxfp8,
