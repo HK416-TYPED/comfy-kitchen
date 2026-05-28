@@ -52,6 +52,14 @@ extern "C" {
                                       int input_dtype_code, int output_dtype_code,
                                       cudaStream_t stream);
 
+    void launch_stochastic_round_fp8_kernel(void* rng_and_output,
+                                            const void* input,
+                                            int64_t numel,
+                                            int rng_dtype_code,
+                                            int input_dtype_code,
+                                            int output_dtype_code,
+                                            cudaStream_t stream);
+
     void launch_cublas_gemm_blockwise_fp4_kernel(
         const void* B_ptr,
         const void* B_decode_scale_ptr,
@@ -106,6 +114,7 @@ extern "C" {
         int64_t orig_cols,
         float epsilon,
         int input_dtype_code,
+        bool hi_first,
         cudaStream_t stream);
 
     void launch_dequantize_nvfp4_kernel(
@@ -116,6 +125,7 @@ extern "C" {
         int64_t num_rows,
         int64_t num_cols,
         int output_dtype_code,
+        bool hi_first,
         cudaStream_t stream);
 
     void launch_quantize_mxfp8_kernel(
@@ -233,6 +243,38 @@ void dequantize_per_tensor_fp8(
                                  numel, input_dtype_code, output_dtype_code, stream);
 }
 
+void stochastic_round_fp8(
+    nb::ndarray<nb::device::cuda> rng_and_output,
+    nb::ndarray<nb::device::cuda> input,
+    int output_dtype_code,
+    int64_t numel,
+    uintptr_t stream_ptr) {
+
+    int rng_dtype_code = map_dtype_to_code(rng_and_output.dtype());
+    if (rng_dtype_code != 3) {
+        throw std::runtime_error("stochastic_round_fp8 requires uint8 RNG storage");
+    }
+
+    int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for stochastic_round_fp8");
+    }
+
+    if (output_dtype_code < 5 || output_dtype_code > 6) {
+        throw std::runtime_error("Unsupported output dtype for stochastic_round_fp8");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_stochastic_round_fp8_kernel(
+        rng_and_output.data(),
+        input.data(),
+        numel,
+        rng_dtype_code,
+        input_dtype_code,
+        output_dtype_code,
+        stream);
+}
+
 // Nanobind wrapper for cublas_gemm_blockwise_fp4
 void cublas_gemm_blockwise_fp4(
     nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> b,
@@ -301,6 +343,7 @@ void quantize_nvfp4(
     nb::ndarray<nb::device::cuda> block_scales,
     float epsilon,
     bool pad_16x,
+    bool hi_first,
     uintptr_t stream_ptr) {
 
     // Get input dimensions (orig_rows, orig_cols)
@@ -335,6 +378,7 @@ void quantize_nvfp4(
         orig_cols,
         epsilon,
         input_dtype_code,
+        hi_first,
         stream);
 }
 
@@ -345,6 +389,7 @@ void dequantize_nvfp4(
     nb::ndarray<nb::device::cuda> block_scales,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
     int output_dtype_code,
+    bool hi_first,
     uintptr_t stream_ptr) {
 
     // Get output dimensions (should match input logical dimensions)
@@ -365,6 +410,7 @@ void dequantize_nvfp4(
         num_rows,
         num_cols,
         output_dtype_code,
+        hi_first,
         stream);
 }
 
@@ -666,6 +712,14 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("numel"),
           nb::arg("stream_ptr"));
+
+    m.def("stochastic_round_fp8", &stochastic_round_fp8,
+          "Stochastically round to FP8, overwriting RNG storage with FP8 output",
+          nb::arg("rng_and_output"),
+          nb::arg("input"),
+          nb::arg("output_dtype_code"),
+          nb::arg("numel"),
+          nb::arg("stream_ptr"));
     
     m.def("cublas_gemm_blockwise_fp4", &cublas_gemm_blockwise_fp4,
           "cuBLAS FP4 GEMM with block-wise scaling",
@@ -698,6 +752,7 @@ NB_MODULE(_C, m) {
           nb::arg("block_scales"),
           nb::arg("epsilon"),
           nb::arg("pad_16x") = false,
+          nb::arg("hi_first") = true,
           nb::arg("stream_ptr"));
 
     m.def("dequantize_nvfp4", &dequantize_nvfp4,
@@ -707,6 +762,7 @@ NB_MODULE(_C, m) {
           nb::arg("block_scales"),
           nb::arg("output"),
           nb::arg("output_dtype_code"),
+          nb::arg("hi_first") = true,
           nb::arg("stream_ptr"));
 
     m.def("quantize_mxfp8", &quantize_mxfp8,

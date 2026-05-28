@@ -12,6 +12,7 @@ from .exceptions import (
     BackendNotImplementedError,
     NoCapableBackendError,
 )
+from .float_utils import from_blocked, swap_nibbles, to_blocked
 
 # Import registry and exceptions
 from .registry import registry
@@ -19,31 +20,38 @@ from .registry import registry
 __version__ = "0.1.0"
 
 __all__ = [
+    # Quantization / dequantization
+    "quantize_per_tensor_fp8",
+    "dequantize_per_tensor_fp8",
+    "quantize_nvfp4",
+    "dequantize_nvfp4",
+    "quantize_mxfp8",
+    "dequantize_mxfp8",
+    "quantize_svdquant_w4a4",
+    # Fused matmul
+    "scaled_mm_nvfp4",
+    "scaled_mm_mxfp8",
+    "scaled_mm_svdquant_w4a4",
+    "gemv_awq_w4a16",
+    # Positional encoding
+    "apply_rope",
+    "apply_rope1",
+    # Utilities
+    "swap_nibbles",
+    "to_blocked",
+    "from_blocked",
+    # Backend configuration
+    "list_backends",
+    "set_backend_priority",
+    "enable_backend",
+    "disable_backend",
+    "stochastic_rounding_fp8",
+    "use_backend",
     # Exceptions
     "BackendError",
     "BackendNotFoundError",
     "BackendNotImplementedError",
     "NoCapableBackendError",
-    # Core functions
-    "apply_rope",
-    "apply_rope1",
-    "dequantize_mxfp8",
-    "dequantize_nvfp4",
-    "dequantize_per_tensor_fp8",
-    # Backend configuration
-    "disable_backend",
-    "enable_backend",
-    "gemv_awq_w4a16",
-    "list_backends",
-    "quantize_mxfp8",
-    "quantize_nvfp4",
-    "quantize_per_tensor_fp8",
-    "quantize_svdquant_w4a4",
-    "scaled_mm_mxfp8",
-    "scaled_mm_nvfp4",
-    "scaled_mm_svdquant_w4a4",
-    "set_backend_priority",
-    "use_backend",
 ]
 
 
@@ -90,11 +98,32 @@ def dequantize_per_tensor_fp8(
     return torch.ops.comfy_kitchen.dequantize_fp8(x, scale, dtype_code)
 
 
+def stochastic_rounding_fp8(
+    x: torch.Tensor,
+    rng: torch.Tensor,
+    output_type: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """Stochastically round tensor to FP8 format.
+
+    Args:
+        x: Input tensor
+        rng: Random uint8 tensor with the same shape as x
+        output_type: FP8 dtype (float8_e4m3fn or float8_e5m2)
+
+    Returns:
+        Stochastically rounded FP8 tensor
+    """
+    kwargs = {"x": x, "rng": rng, "output_type": output_type}
+    impl = registry.get_implementation("stochastic_rounding_fp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
 def quantize_nvfp4(
     x: torch.Tensor,
     per_tensor_scale: torch.Tensor,
     epsilon: float = 0.0,
     pad_16x: bool = False,
+    hi_first: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to NVFP4 format with block-wise scaling.
 
@@ -103,11 +132,14 @@ def quantize_nvfp4(
         per_tensor_scale: Global scale factor
         epsilon: Epsilon for numerical stability
         pad_16x: If True, implicit zero-padding is applied to make dimensions divisible by 16
+        hi_first: Nibble packing order. If True (default), the even-indexed element
+                  is stored in the high nibble of each packed byte. If False, the
+                  even-indexed element is stored in the low nibble.
 
     Returns:
         Tuple of (quantized_tensor, block_scales)
     """
-    return torch.ops.comfy_kitchen.quantize_nvfp4(x, per_tensor_scale, epsilon, pad_16x)
+    return torch.ops.comfy_kitchen.quantize_nvfp4(x, per_tensor_scale, epsilon, pad_16x, hi_first)
 
 
 def dequantize_nvfp4(
@@ -115,6 +147,7 @@ def dequantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     block_scales: torch.Tensor,
     output_type: torch.dtype = torch.bfloat16,
+    hi_first: bool = True,
 ) -> torch.Tensor:
     """Dequantize tensor from NVFP4 format with block-wise scaling.
 
@@ -123,12 +156,15 @@ def dequantize_nvfp4(
         per_tensor_scale: Global scale factor
         block_scales: Block scales in swizzled layout (float8_e4m3fn)
         output_type: Target output dtype (float32, float16, or bfloat16)
+        hi_first: Nibble packing order. Must match the packing order used
+                  during quantization. If True (default), the even-indexed
+                  element is in the high nibble.
 
     Returns:
         Dequantized tensor in specified output format
     """
     dtype_code = DTYPE_TO_CODE[output_type]
-    return torch.ops.comfy_kitchen.dequantize_nvfp4(qx, per_tensor_scale, block_scales, dtype_code)
+    return torch.ops.comfy_kitchen.dequantize_nvfp4(qx, per_tensor_scale, block_scales, dtype_code, hi_first)
 
 
 def scaled_mm_nvfp4(
