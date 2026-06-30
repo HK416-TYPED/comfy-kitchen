@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.backends import cuda
 from comfy_kitchen.tensor import TensorWiseINT8Layout
 
 from .conftest import (
@@ -62,6 +63,24 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
     assert quantization._int8_mm_n_alignment(tensor) == 32
     assert quantization._round_up(17, quantization._int8_mm_n_alignment(tensor)) == 32
     assert calls == [0]
+
+
+def test_cuda_int8_linear_does_not_retain_scratch_tensors():
+    """CUDA INT8 linear uses per-call temporaries instead of retained scratch caches."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randint(-128, 127, (64, 128), device="cuda", dtype=torch.int8)
+    weight_scale = torch.ones((64, 1), device="cuda", dtype=torch.float32)
+
+    out = cuda.int8_linear(x, weight, weight_scale, out_dtype=torch.bfloat16)
+
+    assert out.shape == (16, 64)
+    assert not hasattr(cuda, "_int8_quant_scratch")
+    assert not hasattr(cuda, "_int8_gemm_int32_scratch")
+    assert not hasattr(cuda, "_int8_quant_scratch_tensors")
+    assert not hasattr(cuda, "_int8_gemm_int32_scratch_tensor")
 
 
 # =============================================================================

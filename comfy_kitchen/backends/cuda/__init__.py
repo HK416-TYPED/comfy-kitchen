@@ -145,8 +145,6 @@ from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
-_int8_quant_scratch: dict[tuple[str, int | None, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
-_int8_gemm_int32_scratch: dict[tuple[str, int | None, int, int, int], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
 _shared_memory_per_block_cache: dict[int, int] = {}
@@ -266,33 +264,6 @@ def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor
         empty = torch.empty(0, dtype=dtype, device=device)
         _empty_cuda_tensors[key] = empty
     return empty
-
-
-def _int8_quant_scratch_tensors(
-    device: torch.device, stream_ptr: int, num_rows: int, num_cols: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Internal activation quantization scratch. Key by stream so queued kernels
-    # on different streams cannot overwrite each other's temporary q/scale data.
-    key = (device.type, device.index, stream_ptr, num_rows, num_cols)
-    scratch = _int8_quant_scratch.get(key)
-    if scratch is None:
-        scratch = (
-            torch.empty((num_rows, num_cols), dtype=torch.int8, device=device),
-            torch.empty((num_rows, 1), dtype=torch.float32, device=device),
-        )
-        _int8_quant_scratch[key] = scratch
-    return scratch
-
-
-def _int8_gemm_int32_scratch_tensor(
-    device: torch.device, stream_ptr: int, num_rows: int, num_cols: int
-) -> torch.Tensor:
-    key = (device.type, device.index, stream_ptr, num_rows, num_cols)
-    scratch = _int8_gemm_int32_scratch.get(key)
-    if scratch is None:
-        scratch = torch.empty((num_rows, num_cols), dtype=torch.int32, device=device)
-        _int8_gemm_int32_scratch[key] = scratch
-    return scratch
 
 
 def _int8_weight_scale_arg(weight_scale: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -953,8 +924,6 @@ def int8_linear(
     if not weight.is_contiguous():
         weight = weight.contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
-    q_scratch = None
-    scale_scratch = None
 
     m, k = x_2d.shape
     n, k_w = weight.shape
@@ -978,7 +947,8 @@ def int8_linear(
         and (k <= 2560 or (k == 6144 and n <= 128))
     )
     if convrot_m1_supported or nonconvrot_m1_supported:
-        q_scratch, scale_scratch = _int8_quant_scratch_tensors(x.device, stream_ptr, 1, k)
+        x_qdata = torch.empty((1, k), dtype=torch.int8, device=x.device)
+        x_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
         out = torch.empty((1, n), dtype=out_dtype, device=x.device)
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
@@ -986,8 +956,8 @@ def int8_linear(
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
         _C.int8_linear_m1(
             _wrap_for_dlpack(x_2d),
-            _wrap_for_dlpack(q_scratch),
-            _wrap_for_dlpack(scale_scratch),
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(x_scale),
             _wrap_for_dlpack(weight),
             _wrap_for_dlpack(weight_scale),
             _wrap_for_dlpack(bias_arg),
@@ -1011,17 +981,17 @@ def int8_linear(
             and 256 <= k <= _CONVROT_FUSED_MAX_K
             and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
         ):
-            q_scratch, scale_scratch = _int8_quant_scratch_tensors(x.device, stream_ptr, m, k)
+            x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
+            x_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
             _C.quantize_int8_rowwise_convrot64(
                 _wrap_for_dlpack(x_2d),
-                _wrap_for_dlpack(q_scratch),
-                _wrap_for_dlpack(scale_scratch),
+                _wrap_for_dlpack(x_qdata),
+                _wrap_for_dlpack(x_scale),
                 convrot_groupsize,
                 False,
                 0,
                 stream_ptr,
             )
-            x_qdata, x_scale = q_scratch, scale_scratch
         elif _should_use_convrot_fused_kernel(x_2d, k, convrot_groupsize):
             # Fused single-kernel rotation + row-wise quant (no bf16 HBM round-trip).
             x_qdata, x_scale = quantize_int8_rowwise_convrot(x_2d, convrot_groupsize)
@@ -1030,16 +1000,16 @@ def int8_linear(
             h = _build_hadamard(convrot_groupsize, device=x_2d.device, dtype=x_2d.dtype)
             x_qdata, x_scale = quantize_and_rotate_rowwise(x_2d, h, convrot_groupsize)
     else:
-        q_scratch, scale_scratch = _int8_quant_scratch_tensors(x.device, stream_ptr, m, k)
+        x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
+        x_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
         _C.quantize_int8_rowwise(
             _wrap_for_dlpack(x_2d),
-            _wrap_for_dlpack(q_scratch),
-            _wrap_for_dlpack(scale_scratch),
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(x_scale),
             False,
             0,
             stream_ptr,
         )
-        x_qdata, x_scale = q_scratch, scale_scratch
 
     if m == 1 and k % 4 == 0:
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
@@ -1097,7 +1067,7 @@ def int8_linear(
             cublas_x = x_qdata
             cublas_weight = weight
 
-        out_int32 = _int8_gemm_int32_scratch_tensor(x.device, stream_ptr, m, padded_n)
+        out_int32 = torch.empty((m, padded_n), dtype=torch.int32, device=x.device)
         _C.cublas_gemm_int8(
             _wrap_for_dlpack(cublas_x),
             _wrap_for_dlpack(cublas_weight),
