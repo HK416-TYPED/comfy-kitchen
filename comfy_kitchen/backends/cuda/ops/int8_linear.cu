@@ -7,6 +7,7 @@
 #include "dtype_dispatch.cuh"
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,52 @@ __device__ __forceinline__ T from_float(float val);
 template<> __device__ __forceinline__ float from_float<float>(float val) { return val; }
 template<> __device__ __forceinline__ half from_float<half>(float val) { return __float2half_rn(val); }
 template<> __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float val) { return __float2bfloat16_rn(val); }
+
+template<typename T>
+__device__ __forceinline__ float quant_div_to_float(T val, float scale) {
+    const float scale_t = to_float(from_float<T>(scale));
+    return to_float(from_float<T>(to_float(val) / scale_t));
+}
+
+template<typename T>
+__device__ __forceinline__ float quant_div_float_to_float(float val, float scale) {
+    const float scale_t = to_float(from_float<T>(scale));
+    return to_float(from_float<T>(to_float(from_float<T>(val)) / scale_t));
+}
+
+template<typename T>
+__device__ __forceinline__ float stochastic_sum_to_float(float scaled, T rng) {
+    return to_float(from_float<T>(scaled + to_float(rng)));
+}
+
+template<>
+__device__ __forceinline__ float stochastic_sum_to_float<float>(float scaled, float rng) {
+    return scaled + rng;
+}
+
+template<>
+__device__ __forceinline__ float stochastic_sum_to_float<half>(float scaled, half rng) {
+    return __half2float(__hadd(__float2half_rn(scaled), rng));
+}
+
+template<>
+__device__ __forceinline__ float stochastic_sum_to_float<nv_bfloat16>(float scaled, nv_bfloat16 rng) {
+    return __bfloat162float(__hadd(__float2bfloat16_rn(scaled), rng));
+}
+
+__device__ __forceinline__ uint32_t pcg_hash(uint32_t x) {
+    const uint32_t state = x * 747796405u + 2891336453u;
+    const uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+template<typename T>
+__device__ __forceinline__ T stochastic_rng_value(int64_t idx, uint64_t seed) {
+    const uint64_t key = static_cast<uint64_t>(idx) + seed;
+    const uint32_t folded = static_cast<uint32_t>(key) ^ static_cast<uint32_t>(key >> 32);
+    const float value = static_cast<float>(pcg_hash(folded) >> 8) * 0x1.0p-24f;
+    return from_float<T>(value);
+}
 
 template<typename T>
 __device__ __forceinline__ void store4_contiguous(T* out, int64_t idx, float x, float y, float z, float w) {
@@ -94,12 +141,13 @@ __device__ __forceinline__ int block_reduce_sum_i32_t(int v, int* warp_smem, int
     return *block_smem;
 }
 
-template<typename InputType, int BLOCK_THREADS>
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    int K,
+    uint64_t seed)
 {
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
     __shared__ float warp_smem[kWarps];
@@ -116,16 +164,23 @@ __global__ void quantize_int8_rowwise_kernel(
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
 
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += blockDim.x) {
-        float quantized = nearbyintf(to_float(x[row_offset + col]) * inv_scale);
+        const int idx = row_offset + col;
+        const float scaled = quant_div_to_float<InputType>(x[idx], scale);
+        float quantized;
+        if constexpr (STOCHASTIC) {
+            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+        } else {
+            quantized = nearbyintf(scaled);
+        }
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
@@ -183,12 +238,13 @@ __device__ __forceinline__ float block_reduce_max_t(float v, float* warp_smem, f
     return *block_smem;
 }
 
-template<typename InputType, int BLOCK_THREADS>
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_convrot_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    int K,
+    uint64_t seed)
 {
     constexpr int kGroupsInFlight = BLOCK_THREADS / kConvRotGroup;
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
@@ -248,15 +304,22 @@ __global__ void quantize_int8_rowwise_convrot_kernel(
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        float quantized = nearbyintf(row_buf[col] * inv_scale);
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
+        float quantized;
+        if constexpr (STOCHASTIC) {
+            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+        } else {
+            quantized = nearbyintf(scaled);
+        }
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
@@ -780,13 +843,14 @@ __global__ void rotate_int8_convrot_groups64_kernel(
     }
 }
 
-template<typename InputType, int BLOCK_THREADS>
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_from_partials_kernel(
     const InputType* __restrict__ x,
     const float* __restrict__ partial_absmax,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    int K,
+    uint64_t seed)
 {
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
     __shared__ float warp_smem[kWarps];
@@ -804,24 +868,32 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        float quantized = nearbyintf(to_float(x[row_offset + col]) * inv_scale);
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_to_float<InputType>(x[idx], scale);
+        float quantized;
+        if constexpr (STOCHASTIC) {
+            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+        } else {
+            quantized = nearbyintf(scaled);
+        }
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
-template<typename InputType, int BLOCK_THREADS>
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_convrot64_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    int K,
+    uint64_t seed)
 {
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
@@ -878,15 +950,22 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        float quantized = nearbyintf(row_buf[col] * inv_scale);
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
+        float quantized;
+        if constexpr (STOCHASTIC) {
+            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+        } else {
+            quantized = nearbyintf(scaled);
+        }
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
@@ -903,6 +982,8 @@ void launch_quantize_int8_rowwise_kernel(
     int64_t num_rows,
     int64_t num_cols,
     int input_dtype_code,
+    bool stochastic,
+    uint64_t seed,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -913,20 +994,29 @@ void launch_quantize_int8_rowwise_kernel(
     }
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
+        auto launch = [&](auto kernel, int block_threads) {
+            kernel<<<static_cast<unsigned int>(num_rows), block_threads, 0, stream>>>(
+                static_cast<const InputType*>(input),
+                static_cast<int8_t*>(output),
+                static_cast<float*>(scales),
+                static_cast<int>(num_cols),
+                seed);
+        };
+
         if (num_cols >= 4096 && num_rows != 1) {
-            comfy::quantize_int8_rowwise_kernel<InputType, 512>
-                <<<static_cast<unsigned int>(num_rows), 512, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<int8_t*>(output),
-                    static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_kernel<InputType, 512, true>, 512);
+            } else {
+                launch(comfy::quantize_int8_rowwise_kernel<InputType, 512, false>, 512);
+            }
         } else {
-            comfy::quantize_int8_rowwise_kernel<InputType, comfy::kInt8Threads>
-                <<<static_cast<unsigned int>(num_rows), comfy::kInt8Threads, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<int8_t*>(output),
-                    static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_kernel<InputType, comfy::kInt8Threads, true>,
+                       comfy::kInt8Threads);
+            } else {
+                launch(comfy::quantize_int8_rowwise_kernel<InputType, comfy::kInt8Threads, false>,
+                       comfy::kInt8Threads);
+            }
         }
     });
 
@@ -944,6 +1034,8 @@ void launch_quantize_int8_rowwise_convrot_kernel(
     int64_t num_cols,
     int group_size,
     int input_dtype_code,
+    bool stochastic,
+    uint64_t seed,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -983,12 +1075,21 @@ void launch_quantize_int8_rowwise_convrot_kernel(
                 static_cast<const InputType*>(input),
                 static_cast<int8_t*>(output),
                 static_cast<float*>(scales),
-                static_cast<int>(num_cols));
+                static_cast<int>(num_cols),
+                seed);
         };
         if (wide) {
-            launch(comfy::quantize_int8_rowwise_convrot_kernel<InputType, 1024>);
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot_kernel<InputType, 1024, true>);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot_kernel<InputType, 1024, false>);
+            }
         } else {
-            launch(comfy::quantize_int8_rowwise_convrot_kernel<InputType, 256>);
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot_kernel<InputType, 256, true>);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot_kernel<InputType, 256, false>);
+            }
         }
     });
 
@@ -1055,6 +1156,8 @@ void launch_quantize_int8_convrot_staged_kernel(
     int group_size,
     int input_dtype_code,
     int rotated_dtype_code,
+    bool stochastic,
+    uint64_t seed,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -1095,22 +1198,30 @@ void launch_quantize_int8_convrot_staged_kernel(
 
     const int quant_threads = num_cols >= 4096 ? 512 : comfy::kInt8Threads;
     DISPATCH_FP_DTYPE(rotated_dtype_code, RotatedType, [&] {
+        auto launch = [&](auto kernel, int block_threads) {
+            kernel<<<static_cast<unsigned int>(num_rows), block_threads, 0, stream>>>(
+                static_cast<const RotatedType*>(rotated),
+                static_cast<const float*>(partial_absmax),
+                static_cast<int8_t*>(output),
+                static_cast<float*>(scales),
+                static_cast<int>(num_cols),
+                seed);
+        };
+
         if (quant_threads == 512) {
-            comfy::quantize_int8_rowwise_from_partials_kernel<RotatedType, 512>
-                <<<static_cast<unsigned int>(num_rows), 512, 0, stream>>>(
-                    static_cast<const RotatedType*>(rotated),
-                    static_cast<const float*>(partial_absmax),
-                    static_cast<int8_t*>(output),
-                    static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_from_partials_kernel<RotatedType, 512, true>, 512);
+            } else {
+                launch(comfy::quantize_int8_rowwise_from_partials_kernel<RotatedType, 512, false>, 512);
+            }
         } else {
-            comfy::quantize_int8_rowwise_from_partials_kernel<RotatedType, comfy::kInt8Threads>
-                <<<static_cast<unsigned int>(num_rows), comfy::kInt8Threads, 0, stream>>>(
-                    static_cast<const RotatedType*>(rotated),
-                    static_cast<const float*>(partial_absmax),
-                    static_cast<int8_t*>(output),
-                    static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_from_partials_kernel<RotatedType, comfy::kInt8Threads, true>,
+                       comfy::kInt8Threads);
+            } else {
+                launch(comfy::quantize_int8_rowwise_from_partials_kernel<RotatedType, comfy::kInt8Threads, false>,
+                       comfy::kInt8Threads);
+            }
         }
     });
 
@@ -1128,6 +1239,8 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     int64_t num_cols,
     int group_size,
     int input_dtype_code,
+    bool stochastic,
+    uint64_t seed,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -1163,27 +1276,53 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 static_cast<const InputType*>(input),
                 static_cast<int8_t*>(output),
                 static_cast<float*>(scales),
-                static_cast<int>(num_cols));
+                static_cast<int>(num_cols),
+                seed);
         };
 
         if (num_rows == 1) {
-            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_single>,
-                   block_threads_single);
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_single, true>,
+                       block_threads_single);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_single, false>,
+                       block_threads_single);
+            }
         } else if (num_cols == comfy::kConvRotGroup) {
             constexpr int block_threads_256 = 64;
-            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_256>,
-                   block_threads_256);
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_256, true>,
+                       block_threads_256);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_256, false>,
+                       block_threads_256);
+            }
         } else if (num_cols == 2560) {
             constexpr int block_threads_2560 = 640;
-            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2560>,
-                   block_threads_2560);
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2560, true>,
+                       block_threads_2560);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2560, false>,
+                       block_threads_2560);
+            }
         } else if (num_cols == 6144) {
             constexpr int block_threads_6144 = 768;
-            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_6144>,
-                   block_threads_6144);
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_6144, true>,
+                       block_threads_6144);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_6144, false>,
+                       block_threads_6144);
+            }
         } else {
-            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi>,
-                   block_threads_multi);
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi, true>,
+                       block_threads_multi);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi, false>,
+                       block_threads_multi);
+            }
         }
     });
 
