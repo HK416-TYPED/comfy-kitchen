@@ -148,6 +148,7 @@ extern "C" {
         int64_t M,
         int64_t M_pad,
         int64_t K,
+        int64_t n_scale_groups,
         int input_dtype_code,
         bool rotate,
         cudaStream_t stream);
@@ -188,6 +189,7 @@ extern "C" {
         int fast_accum,
         int shared_scale,
         int fuse_lora,
+        int rank_one,
         cudaStream_t stream);
 
     // AWQ W4A16 — see ops/awq_w4a16.cu. Internal M-routing picks
@@ -625,12 +627,13 @@ void int4_tensorwise_quantize(
     int64_t M = static_cast<int64_t>(x.shape(0));
     int64_t K = static_cast<int64_t>(x.shape(1));
     int64_t M_pad = static_cast<int64_t>(q_x.shape(0));
+    int64_t n_scale_groups = static_cast<int64_t>(ascales.shape(0));
     int input_code = svdquant_dtype_code(x.dtype());
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int4_tensorwise_quantize_kernel(
         x.data(), q_x.data(), ascales.data(),
-        M, M_pad, K, input_code, rotate, stream);
+        M, M_pad, K, n_scale_groups, input_code, rotate, stream);
 }
 
 void svdquant_quantize_w4a4(
@@ -670,6 +673,7 @@ void svdquant_scaled_mm_w4a4(
     bool fast_accum,
     bool shared_scale,
     bool fuse_lora,
+    bool rank_one,
     uintptr_t stream_ptr)
 {
     int M = static_cast<int>(act.shape(0));
@@ -708,7 +712,8 @@ void svdquant_scaled_mm_w4a4(
         M, N, K, R,
         static_cast<int>(act_unsigned), out_code,
         static_cast<int>(tile_packed), static_cast<int>(fast_accum),
-        static_cast<int>(shared_scale), static_cast<int>(fuse_lora), stream);
+        static_cast<int>(shared_scale), static_cast<int>(fuse_lora),
+        static_cast<int>(rank_one), stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,6 +1662,7 @@ NB_MODULE(_C, m) {
           nb::arg("fast_accum"),
           nb::arg("shared_scale"),
           nb::arg("fuse_lora"),
+          nb::arg("rank_one"),
           nb::arg("stream_ptr"));
 
     m.def("awq_w4a16", &awq_w4a16,

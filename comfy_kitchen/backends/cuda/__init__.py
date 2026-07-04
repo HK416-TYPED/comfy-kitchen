@@ -1366,6 +1366,7 @@ def scaled_mm_svdquant_w4a4(
     lora_up: torch.Tensor,
     bias: torch.Tensor | None = None,
     act_unsigned: bool = False,
+    rank_one: bool = False,
 ) -> torch.Tensor:
     """SVDQuant W4A4 int4 GEMM + LoRA-up + bias (CUDA).
 
@@ -1427,6 +1428,7 @@ def scaled_mm_svdquant_w4a4(
         fast_accum,
         shared_scale,
         fuse_lora,
+        rank_one,
         stream_ptr,
     )
 
@@ -1481,7 +1483,9 @@ def int4_linear(
     M_pad = roundup(max(M, 1), 256)
 
     q_x = torch.empty(M_pad, k_half, dtype=torch.int8, device=x.device)
-    ascales = torch.empty(K // 64, M_pad, dtype=x2d.dtype, device=x.device)
+    # Rank-1 GEMM path reads only the first scale-group row, so a single-group
+    # ascales buffer suffices (the quantize kernel writes ascales.shape[0] groups).
+    ascales = torch.empty(1, M_pad, dtype=x2d.dtype, device=x.device)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
     _C.int4_tensorwise_quantize(
         _wrap_for_dlpack(x2d),
@@ -1491,15 +1495,8 @@ def int4_linear(
         stream_ptr,
     )
 
-    # Rank-1 weight scale broadcast into the (K/64, N) per-group layout. Computed
-    # per call: a data_ptr-keyed cache is unsafe (the allocator reuses freed
-    # addresses) and the broadcast costs ~microseconds per layer.
-    wscales = (
-        weight_scale.reshape(1, N)
-        .to(device=weight.device, dtype=x2d.dtype)
-        .expand(K // 64, N)
-        .contiguous()
-    )
+    # Rank-1 GEMM path reads only the first wscales row: no per-group broadcast.
+    wscales = weight_scale.reshape(1, N).to(device=weight.device, dtype=x2d.dtype).contiguous()
 
     lkey = (x.device.index, out_dtype, N)
     lora = _INT4_TENSORWISE_EMPTY_LORA_CACHE.get(lkey)
@@ -1520,6 +1517,7 @@ def int4_linear(
         lora,
         bias=bias,
         act_unsigned=False,
+        rank_one=True,
     )
     return out[:M].reshape(*orig_shape[:-1], N)
 

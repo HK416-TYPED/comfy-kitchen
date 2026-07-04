@@ -109,13 +109,13 @@ __global__ void quantize_int4_tensorwise_kernel(
     InputType* __restrict__ ascales,
     int M,
     int M_pad,
-    int K)
+    int K,
+    int n_scale_groups)
 {
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
     const int row = static_cast<int>(blockIdx.x);
     const int tid = threadIdx.x;
     const int k_half = K / 2;
-    const int n_scale_groups = K / kInt4ScaleGroup;
 
     if (row >= M) {
         // Padding row: benign zeros (the GEMM output rows are discarded).
@@ -137,8 +137,23 @@ __global__ void quantize_int4_tensorwise_kernel(
     const int64_t row_offset = static_cast<int64_t>(row) * K;
 
     if constexpr (ROTATE) {
-        for (int col = tid; col < K; col += BLOCK_THREADS) {
-            row_buf[col] = i4_to_float(x[row_offset + col]);
+        if constexpr (sizeof(InputType) == 2) {
+            // 16-byte vectorized loads: 8 elements per iteration per thread.
+            const uint4* x4 = reinterpret_cast<const uint4*>(x + row_offset);
+            const int n_vec = K / 8;
+            for (int v = tid; v < n_vec; v += BLOCK_THREADS) {
+                const uint4 raw = x4[v];
+                const InputType* e = reinterpret_cast<const InputType*>(&raw);
+                const int base = v * 8;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    row_buf[base + j] = i4_to_float(e[j]);
+                }
+            }
+        } else {
+            for (int col = tid; col < K; col += BLOCK_THREADS) {
+                row_buf[col] = i4_to_float(x[row_offset + col]);
+            }
         }
         __syncthreads();
 
@@ -197,19 +212,33 @@ __global__ void quantize_int4_tensorwise_kernel(
     }
 
     // Quantize + pack two codes per byte, LOW nibble first.
-    for (int p = tid; p < k_half; p += BLOCK_THREADS) {
-        const int col = 2 * p;
-        float v0, v1;
-        if constexpr (ROTATE) {
-            v0 = i4_quant_div<InputType>(row_buf[col], scale);
-            v1 = i4_quant_div<InputType>(row_buf[col + 1], scale);
-        } else {
-            v0 = i4_quant_div<InputType>(i4_to_float(x[row_offset + col]), scale);
-            v1 = i4_quant_div<InputType>(i4_to_float(x[row_offset + col + 1]), scale);
+    if constexpr (ROTATE) {
+        // Vectorized: each thread packs 8 rotated values into 4 bytes (uchar4).
+        uchar4* q4 = reinterpret_cast<uchar4*>(q + static_cast<int64_t>(row) * k_half);
+        const int n_vec = k_half / 4;
+        for (int v = tid; v < n_vec; v += BLOCK_THREADS) {
+            const int col = v * 8;
+            uchar4 packed;
+            unsigned char* pb = reinterpret_cast<unsigned char*>(&packed);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float a = i4_quant_div<InputType>(row_buf[col + 2 * j], scale);
+                const float b = i4_quant_div<InputType>(row_buf[col + 2 * j + 1], scale);
+                const float c0 = fminf(kInt4Max, fmaxf(-kInt4Max, nearbyintf(a)));
+                const float c1 = fminf(kInt4Max, fmaxf(-kInt4Max, nearbyintf(b)));
+                pb[j] = static_cast<unsigned char>(i4_pack_pair(c0, c1));
+            }
+            q4[v] = packed;
         }
-        const float c0 = fminf(kInt4Max, fmaxf(-kInt4Max, nearbyintf(v0)));
-        const float c1 = fminf(kInt4Max, fmaxf(-kInt4Max, nearbyintf(v1)));
-        q[static_cast<int64_t>(row) * k_half + p] = i4_pack_pair(c0, c1);
+    } else {
+        for (int p = tid; p < k_half; p += BLOCK_THREADS) {
+            const int col = 2 * p;
+            const float v0 = i4_quant_div<InputType>(i4_to_float(x[row_offset + col]), scale);
+            const float v1 = i4_quant_div<InputType>(i4_to_float(x[row_offset + col + 1]), scale);
+            const float c0 = fminf(kInt4Max, fmaxf(-kInt4Max, nearbyintf(v0)));
+            const float c1 = fminf(kInt4Max, fmaxf(-kInt4Max, nearbyintf(v1)));
+            q[static_cast<int64_t>(row) * k_half + p] = i4_pack_pair(c0, c1);
+        }
     }
 }
 
@@ -226,6 +255,7 @@ void launch_int4_tensorwise_quantize_kernel(
     int64_t M,
     int64_t M_pad,
     int64_t K,
+    int64_t n_scale_groups,
     int input_dtype_code,
     bool rotate,
     cudaStream_t stream)
@@ -265,7 +295,8 @@ void launch_int4_tensorwise_quantize_kernel(
                 static_cast<InputType*>(ascales),
                 static_cast<int>(M),
                 static_cast<int>(M_pad),
-                static_cast<int>(K));
+                static_cast<int>(K),
+                static_cast<int>(n_scale_groups));
         } else {
             constexpr int kBlockThreads = 256;
             auto kernel = comfy::quantize_int4_tensorwise_kernel<InputType, kBlockThreads, false>;
@@ -275,7 +306,8 @@ void launch_int4_tensorwise_quantize_kernel(
                 static_cast<InputType*>(ascales),
                 static_cast<int>(M),
                 static_cast<int>(M_pad),
-                static_cast<int>(K));
+                static_cast<int>(K),
+                static_cast<int>(n_scale_groups));
         }
     });
 }

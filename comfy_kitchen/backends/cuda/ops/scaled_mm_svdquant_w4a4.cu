@@ -221,7 +221,8 @@ template<
     bool kTilePacked,
     bool kFastAccum,
     bool kSharedScale,
-    bool kFuseLora>
+    bool kFuseLora,
+    bool kRankOne>
 __global__ void svdquant_scaled_mm_w4a4_kernel(
     const int8_t* __restrict__ act,          // (M, K/2)
     const int8_t* __restrict__ wgt,          // (N, K/2)
@@ -267,6 +268,21 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     using Pair = typename Vec2::Pair;
     float out_f[kMUnroll][kNUnroll][4];
     Pair out_h[kMUnroll][kNUnroll][2];
+    // kRankOne: per-row x per-col scales factor out of the K loop entirely, so the
+    // MMA carries raw int32 accumulators across ALL K groups (|acc| <= 49*K << 2^31)
+    // and dequantization collapses into the epilogue — no per-group scale loads, no
+    // per-group fp conversion (the QServe W4A4 main-loop critique does not apply).
+    int32_t acc_i[kMUnroll][kNUnroll][4];
+    if constexpr (kRankOne) {
+        #pragma unroll
+        for (int mi = 0; mi < kMUnroll; ++mi) {
+            #pragma unroll
+            for (int c = 0; c < kNUnroll; ++c) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) acc_i[mi][c][i] = 0;
+            }
+        }
+    }
     if constexpr (kFastAccum) {
         #pragma unroll
         for (int mi = 0; mi < kMUnroll; ++mi) {
@@ -445,15 +461,17 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                 a_reg[mi][1] = *reinterpret_cast<const uint32_t*>(rb + tid_in_group * 8);
                 a_reg[mi][3] = *reinterpret_cast<const uint32_t*>(rb + tid_in_group * 8 + 4);
             }
-            as_row0_arr[mi] = (row0_m < M) ? load_scale<OutType>(&ascales[g * M + row0_m]) : 0.f;
-            as_row1_arr[mi] = (row1_m < M) ? load_scale<OutType>(&ascales[g * M + row1_m]) : 0.f;
+            if constexpr (!kRankOne) {
+                as_row0_arr[mi] = (row0_m < M) ? load_scale<OutType>(&ascales[g * M + row0_m]) : 0.f;
+                as_row1_arr[mi] = (row1_m < M) ? load_scale<OutType>(&ascales[g * M + row1_m]) : 0.f;
+            }
         }
 
         // Pre-load this K-iter's wscales into per-lane registers, hoisted out of
         // the inner MMA loop so the compiler can schedule the loads ahead of MMAs.
         float ws_regs[kNUnroll][2];
         #pragma unroll
-        for (int cc = 0; cc < kNUnroll; ++cc) {
+        for (int cc = 0; cc < kNUnroll && !kRankOne; ++cc) {
             const int col0 = warp_n_base + cc * 8 + tid_in_group * 2 + 0;
             const int col1 = warp_n_base + cc * 8 + tid_in_group * 2 + 1;
             if constexpr (kSharedScale) {
@@ -504,6 +522,15 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
             // Reuse b_reg for each M-tile
             #pragma unroll
             for (int mi = 0; mi < kMUnroll; ++mi) {
+                if constexpr (kRankOne) {
+                    // Accumulate raw int32 across the whole K loop; dequant in epilogue.
+                    if constexpr (kActUnsigned) {
+                        mma_m16n8k64_u4s4s32(a_reg[mi], b_reg, acc_i[mi][c], acc_i[mi][c]);
+                    } else {
+                        mma_m16n8k64_s4s4s32(a_reg[mi], b_reg, acc_i[mi][c], acc_i[mi][c]);
+                    }
+                    continue;
+                }
                 int32_t c_reg[4] = {0, 0, 0, 0};
                 int32_t d_reg[4];
                 if constexpr (kActUnsigned) {
@@ -536,6 +563,30 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
         }
     }
     cp_async_wait_group<0>();  // drain pipeline
+
+    if constexpr (kRankOne) {
+        // Rank-1 dequant: one per-row and one per-col scale (read from the first
+        // group row of the (possibly 1-group) ascales/wscales buffers).
+        #pragma unroll
+        for (int mi = 0; mi < kMUnroll; ++mi) {
+            const int m_tile_base = warp_m_base + mi * 16;
+            const int row0_m = m_tile_base + groupID;
+            const int row1_m = m_tile_base + groupID + 8;
+            const float as0 = (row0_m < M) ? load_scale<OutType>(&ascales[row0_m]) : 0.f;
+            const float as1 = (row1_m < M) ? load_scale<OutType>(&ascales[row1_m]) : 0.f;
+            #pragma unroll
+            for (int c = 0; c < kNUnroll; ++c) {
+                const int col0 = warp_n_base + c * 8 + tid_in_group * 2 + 0;
+                const int col1 = col0 + 1;
+                const float ws0 = (col0 < N) ? load_scale<OutType>(&wscales[col0]) : 0.f;
+                const float ws1 = (col1 < N) ? load_scale<OutType>(&wscales[col1]) : 0.f;
+                out_f[mi][c][0] = static_cast<float>(acc_i[mi][c][0]) * as0 * ws0;
+                out_f[mi][c][1] = static_cast<float>(acc_i[mi][c][1]) * as0 * ws1;
+                out_f[mi][c][2] = static_cast<float>(acc_i[mi][c][2]) * as1 * ws0;
+                out_f[mi][c][3] = static_cast<float>(acc_i[mi][c][3]) * as1 * ws1;
+            }
+        }
+    }
 
     if constexpr (kFuseLora) {
         // LoRA-up epilogue: out += lora_act_in @ lora_up.T.
@@ -688,6 +739,7 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
     int fast_accum,
     int shared_scale,
     int fuse_lora,
+    int rank_one,
     cudaStream_t stream)
 {
     if (K % comfy::svdquant::kGroupSize != 0) return;
@@ -695,9 +747,32 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
     const dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
     const dim3 block(kNumWarps * 32);
 
+    if (rank_one) {
+        // int4_tensorwise path: natural layout, signed, robust accumulator, no LoRA.
+        #define LAUNCH_GEMM_R1(OutType)                                                     \
+            svdquant_scaled_mm_w4a4_kernel<OutType, false, false, false, false, false, true>\
+                <<<grid, block, 0, stream>>>(                                               \
+                reinterpret_cast<const int8_t*>(act),                                       \
+                reinterpret_cast<const int8_t*>(wgt),                                       \
+                reinterpret_cast<const OutType*>(ascales),                                  \
+                reinterpret_cast<const OutType*>(wscales),                                  \
+                reinterpret_cast<const OutType*>(lora_act_in),                              \
+                reinterpret_cast<const OutType*>(lora_up),                                  \
+                reinterpret_cast<const OutType*>(bias),                                     \
+                reinterpret_cast<OutType*>(out),                                            \
+                M, N, K, R)
+        if (out_dtype_code == 2 /* bf16 */) {
+            LAUNCH_GEMM_R1(__nv_bfloat16);
+        } else if (out_dtype_code == 1 /* fp16 */) {
+            LAUNCH_GEMM_R1(__half);
+        }
+        #undef LAUNCH_GEMM_R1
+        return;
+    }
+
     #define LAUNCH_GEMM(OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora) \
         svdquant_scaled_mm_w4a4_kernel<                                                     \
-            OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora>                \
+            OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora, false>         \
             <<<grid, block, 0, stream>>>(                                                   \
             reinterpret_cast<const int8_t*>(act),                                           \
             reinterpret_cast<const int8_t*>(wgt),                                           \
