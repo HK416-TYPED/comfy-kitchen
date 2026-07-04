@@ -67,6 +67,7 @@ using comfy::svdquant::kGroupSize;
 using comfy::svdquant::mma_m16n8k64_s4s4s32;
 using comfy::svdquant::mma_m16n8k64_u4s4s32;
 using comfy::svdquant::cvta_smem_u32;
+using comfy::svdquant::ldmatrix_x2;
 using comfy::svdquant::ldmatrix_x4;
 using comfy::svdquant::mma_m16n8k16_f32;
 using comfy::svdquant::cp_async_16b;
@@ -254,6 +255,10 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     constexpr int kStages = kStagesT;
     constexpr int kBLoadSweeps = (kBlockN * 2 + kThreadsPerBlock - 1) / kThreadsPerBlock;
     constexpr int kALoadSweeps = (kBlockM * 2 + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    // Rank-one loads fragments with ldmatrix; a 48-byte smem row stride staggers the
+    // 8 row addresses of each ldmatrix phase across distinct bank groups (32-byte
+    // stride would alias rows r and r+4). Non-rank-one keeps the packed 32B stride.
+    constexpr int kSmemRowBytes = kRankOne ? (kBlockKBytes + 16) : kBlockKBytes;
     static_assert((kWarpsM & (kWarpsM - 1)) == 0, "kWarpsM must be a power of two");
 
     // CTA coordinates
@@ -331,8 +336,8 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     // Shared memory: triple-buffered A and B tiles.
     // B stage: kBlockN rows × kBlockKBytes bytes = 128 * 32 = 4 KB
     // A stage: kBlockM rows × kBlockKBytes bytes =  32 * 32 = 1 KB
-    __shared__ alignas(16) int8_t smem_B[kStages][kBlockN * kBlockKBytes];
-    __shared__ alignas(16) int8_t smem_A[kStages][kBlockM * kBlockKBytes];
+    __shared__ alignas(16) int8_t smem_B[kStages][kBlockN * kSmemRowBytes];
+    __shared__ alignas(16) int8_t smem_A[kStages][kBlockM * kSmemRowBytes];
     __shared__ alignas(16) int8_t smem_WS[kSharedScale ? kStages : 1][kBlockN * sizeof(OutType)];
     __shared__ alignas(16) OutType smem_LoraA[kFuseLora ? (kBlockM * kLoraRankTile) : 1];
     __shared__ alignas(16) OutType smem_LoraB[kFuseLora ? (kBlockN * kLoraRankTile) : 1];
@@ -349,7 +354,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                 const int n_row = t >> 1;
                 const int half  = t & 1;
                 const int n_global = cta_n + n_row;
-                int8_t* dst = &smem_B[stage][n_row * kBlockKBytes + half * 16];
+                int8_t* dst = &smem_B[stage][n_row * kSmemRowBytes + half * 16];
                 if (n_global < N) {
                     const int8_t* src;
                     if constexpr (kTilePacked) {
@@ -372,12 +377,22 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     };
 
     auto load_B_fragment = [&](int stage, int c, uint32_t (&b_reg)[2]) {
+        if constexpr (kRankOne) {
+            // ldmatrix.x2: lanes 0..15 address the 8 n-rows x two 16B k-chunks of
+            // this N-chunk's tile (staging zero-pads OOB rows, so no guard needed).
+            const int r = lane & 7;
+            const int h = (lane >> 3) & 1;
+            const int row_local = (warp_n * kWarpN) + c * 8 + r;
+            const int8_t* addr = &smem_B[stage][row_local * kSmemRowBytes + h * 16];
+            ldmatrix_x2(b_reg, cvta_smem_u32(addr));
+            return;
+        }
         const int b_col_local = (warp_n * kWarpN) + c * 8 + groupID;
         const int b_col_global = cta_n + b_col_local;
         b_reg[0] = b_reg[1] = 0;
         if (b_col_local < kBlockN && b_col_global < N) {
             const int byte0 = tid_in_group * 8;
-            const int8_t* row_base = &smem_B[stage][b_col_local * kBlockKBytes];
+            const int8_t* row_base = &smem_B[stage][b_col_local * kSmemRowBytes];
             b_reg[0] = *reinterpret_cast<const uint32_t*>(row_base + byte0);
             b_reg[1] = *reinterpret_cast<const uint32_t*>(row_base + byte0 + 4);
         }
@@ -393,7 +408,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                 const int m_row = t >> 1;
                 const int half  = t & 1;
                 const int m_global = cta_m + m_row;
-                int8_t* dst = &smem_A[stage][m_row * kBlockKBytes + half * 16];
+                int8_t* dst = &smem_A[stage][m_row * kSmemRowBytes + half * 16];
                 if (m_global < M) {
                     const int8_t* src = act + m_global * K_half + g * kBlockKBytes + half * 16;
                     cp_async_16b(dst, src);
@@ -466,6 +481,17 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
         float as_row0_arr[kMUnroll], as_row1_arr[kMUnroll];
         #pragma unroll
         for (int mi = 0; mi < kMUnroll; ++mi) {
+            if constexpr (kRankOne) {
+                // ldmatrix.x4 over the 16-row x 32B A tile: matrices land as
+                // {r0k0, r1k0, r0k1, r1k1} — the exact s4 MMA A-fragment order.
+                // Both operands use the same ldmatrix k-permutation, so the MMA
+                // dot product is unchanged; staging zero-pads rows >= M.
+                const int row_local = warp_m * kWarpM + mi * 16 + (lane & 15);
+                const int8_t* addr =
+                    &smem_A[cur_stage][row_local * kSmemRowBytes + ((lane >> 4) & 1) * 16];
+                ldmatrix_x4(a_reg[mi], cvta_smem_u32(addr));
+                continue;
+            }
             const int m_tile_base = warp_m_base + mi * 16;
             const int row0_m = m_tile_base + groupID;
             const int row1_m = m_tile_base + groupID + 8;
@@ -473,12 +499,12 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
             const int row1_local = warp_m * kWarpM + mi * 16 + groupID + 8;
             a_reg[mi][0] = a_reg[mi][1] = a_reg[mi][2] = a_reg[mi][3] = 0;
             if (row0_m < M) {
-                const int8_t* rb = &smem_A[cur_stage][row0_local * kBlockKBytes];
+                const int8_t* rb = &smem_A[cur_stage][row0_local * kSmemRowBytes];
                 a_reg[mi][0] = *reinterpret_cast<const uint32_t*>(rb + tid_in_group * 8);
                 a_reg[mi][2] = *reinterpret_cast<const uint32_t*>(rb + tid_in_group * 8 + 4);
             }
             if (row1_m < M) {
-                const int8_t* rb = &smem_A[cur_stage][row1_local * kBlockKBytes];
+                const int8_t* rb = &smem_A[cur_stage][row1_local * kSmemRowBytes];
                 a_reg[mi][1] = *reinterpret_cast<const uint32_t*>(rb + tid_in_group * 8);
                 a_reg[mi][3] = *reinterpret_cast<const uint32_t*>(rb + tid_in_group * 8 + 4);
             }
