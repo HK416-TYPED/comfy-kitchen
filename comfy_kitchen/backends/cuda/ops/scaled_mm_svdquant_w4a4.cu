@@ -222,7 +222,8 @@ template<
     bool kFastAccum,
     bool kSharedScale,
     bool kFuseLora,
-    bool kRankOne>
+    bool kRankOne,
+    int kMUnrollT = kMUnroll>
 __global__ void svdquant_scaled_mm_w4a4_kernel(
     const int8_t* __restrict__ act,          // (M, K/2)
     const int8_t* __restrict__ wgt,          // (N, K/2)
@@ -237,6 +238,12 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     if constexpr (!kFuseLora) {
         (void)lora_act_in; (void)lora_up; (void)R;
     }
+
+    // M-tile geometry may be widened per instantiation (rank-one uses a taller
+    // CTA to cut B-tile rereads); these shadow the file-scope defaults.
+    constexpr int kMUnroll = kMUnrollT;
+    constexpr int kWarpM   = kMUnroll * 16;
+    constexpr int kBlockM  = kWarpM * kWarpsM;
 
     // CTA coordinates
     const int cta_m = blockIdx.y * kBlockM;
@@ -749,9 +756,15 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
 
     if (rank_one) {
         // int4_tensorwise path: natural layout, signed, robust accumulator, no LoRA.
+        // Taller M tile (kMUnroll=4 -> 128 M/CTA) quarters B-tile rereads vs the
+        // default geometry; the freed per-group scale registers pay for it.
+        constexpr int kMUnrollR1 = 4;
+        constexpr int kBlockM_R1 = kMUnrollR1 * 16 * kWarpsM;
+        const dim3 grid_r1((N + kBlockN - 1) / kBlockN, (M + kBlockM_R1 - 1) / kBlockM_R1);
         #define LAUNCH_GEMM_R1(OutType)                                                     \
-            svdquant_scaled_mm_w4a4_kernel<OutType, false, false, false, false, false, true>\
-                <<<grid, block, 0, stream>>>(                                               \
+            svdquant_scaled_mm_w4a4_kernel<OutType, false, false, false, false, false, true,\
+                                           kMUnrollR1>                                      \
+                <<<grid_r1, block, 0, stream>>>(                                            \
                 reinterpret_cast<const int8_t*>(act),                                       \
                 reinterpret_cast<const int8_t*>(wgt),                                       \
                 reinterpret_cast<const OutType*>(ascales),                                  \
