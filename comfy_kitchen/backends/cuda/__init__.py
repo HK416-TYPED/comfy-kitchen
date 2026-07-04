@@ -33,6 +33,7 @@ __all__ = [
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
     "int8_linear",
+    "int4_linear",
     "quantize_int8_tensorwise",
     "quantize_int8_rowwise",
     "quantize_int8_convrot_weight",
@@ -1438,6 +1439,91 @@ def scaled_mm_svdquant_w4a4(
     return out
 
 
+_INT4_TENSORWISE_EMPTY_LORA_CACHE: dict = {}
+
+
+def int4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """int4_tensorwise W4A4 linear (CUDA): fused ConvRot + per-row int4 activation
+    quantize, then the SVDQuant s4 MMA GEMM with rank-1 scales broadcast into the
+    per-group layout (exact special case; no LoRA branch).
+
+    Layouts:
+      x            (..., K)   bf16/fp16
+      weight       (N, K/2)   int8, two signed int4/byte low-nibble-first, natural row-major
+      weight_scale (N,)/(N,1) fp32 per-output-channel
+      bias         (N,)       optional
+      out          (..., N)   out_dtype
+    """
+    k_half = weight.shape[-1]
+    K = k_half * 2
+    N = weight.shape[0]
+    if x.shape[-1] != K:
+        raise ValueError(
+            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {K} "
+            f"(packed weight {tuple(weight.shape)})"
+        )
+    if convrot and convrot_groupsize != 256:
+        raise ValueError("int4_tensorwise fused kernel only supports convrot_groupsize 256")
+    if convrot and K % 256 != 0:
+        raise ValueError(f"ConvRot group size 256 does not divide input features {K}")
+
+    orig_shape = x.shape
+    x2d = x.reshape(-1, K).contiguous()
+    M = x2d.shape[0]
+    M_pad = roundup(max(M, 1), 256)
+
+    q_x = torch.empty(M_pad, k_half, dtype=torch.int8, device=x.device)
+    ascales = torch.empty(K // 64, M_pad, dtype=x2d.dtype, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.int4_tensorwise_quantize(
+        _wrap_for_dlpack(x2d),
+        _wrap_for_dlpack(q_x),
+        _wrap_for_dlpack(ascales),
+        bool(convrot),
+        stream_ptr,
+    )
+
+    # Rank-1 weight scale broadcast into the (K/64, N) per-group layout. Computed
+    # per call: a data_ptr-keyed cache is unsafe (the allocator reuses freed
+    # addresses) and the broadcast costs ~microseconds per layer.
+    wscales = (
+        weight_scale.reshape(1, N)
+        .to(device=weight.device, dtype=x2d.dtype)
+        .expand(K // 64, N)
+        .contiguous()
+    )
+
+    lkey = (x.device.index, out_dtype, N)
+    lora = _INT4_TENSORWISE_EMPTY_LORA_CACHE.get(lkey)
+    if lora is None:
+        lora = torch.empty(N, 0, dtype=out_dtype, device=x.device)
+        _INT4_TENSORWISE_EMPTY_LORA_CACHE[lkey] = lora
+    lora_act = torch.empty(M_pad, 0, dtype=out_dtype, device=x.device)
+
+    if bias is not None and bias.dtype != out_dtype:
+        bias = bias.to(out_dtype)
+
+    out = scaled_mm_svdquant_w4a4(
+        q_x,
+        weight,
+        ascales,
+        wscales,
+        lora_act,
+        lora,
+        bias=bias,
+        act_unsigned=False,
+    )
+    return out[:M].reshape(*orig_shape[:-1], N)
+
+
 # Above this M the fused MMA kernel falls behind cuBLAS bf16 GEMM on Blackwell
 # (cuBLAS approaches peak; the kernel here is single-thread-per-N-row in the
 # dequant pass and lacks cp.async pipelining). Empirically the crossover sits
@@ -1817,6 +1903,18 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})
                 ),
                 "lora_up": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
+        "int4_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})),
+                "bias": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),

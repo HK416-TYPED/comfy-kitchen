@@ -177,6 +177,56 @@ def test_int4_linear_convrot_group_must_divide():
         int4_linear(torch.randn(4, 96), wq, ws, None, torch.float32, convrot=True, convrot_groupsize=64)
 
 
+class TestInt4LinearCudaParity:
+    """CUDA int4_linear (fused ConvRot + s4 MMA via the svdquant GEMM) vs eager."""
+
+    @pytest.fixture(autouse=True)
+    def cuda_kernel_only(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        try:
+            from comfy_kitchen.backends.cuda import _C  # noqa: F401
+        except Exception:
+            pytest.skip("compiled comfy_kitchen CUDA extension required")
+        if torch.cuda.get_device_capability() < (8, 0):
+            pytest.skip("int4 MMA path requires SM >= 8.0")
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("convrot", [False, True])
+    @pytest.mark.parametrize("shape", [(1, 512, 256), (37, 3072, 1024), (300, 12288, 512)])
+    def test_matches_eager(self, seed, dtype, convrot, shape):
+        from comfy_kitchen.backends.cuda import int4_linear as cuda_int4_linear
+
+        M, K, N = shape
+        x = torch.randn(M, K, dtype=dtype, device="cuda")
+        w = torch.randn(N, K, dtype=dtype, device="cuda")
+        bias = torch.randn(N, dtype=dtype, device="cuda")
+        if convrot:
+            wq, ws = quantize_int4_convrot_weight(w, 256)
+        else:
+            wq, ws = quantize_int4_rowwise(w)
+        y_ref = int4_linear(x, wq, ws, bias, dtype, convrot, 256).float()
+        y_cuda = cuda_int4_linear(x, wq, ws, bias, dtype, convrot, 256).float()
+        # The GEMM epilogue uses 16-bit (a/w)scales vs eager's fp32; the ConvRot
+        # path additionally rounds the fp32 FHT output through the source dtype
+        # to reproduce eager's rotated values. Residual divergence is boundary
+        # code flips at ~1e-3 relative.
+        rel = (y_cuda - y_ref).norm() / y_ref.norm().clamp(min=1e-9)
+        assert rel.item() < 0.02, f"cuda/eager divergence {rel:.5f} (convrot={convrot}, {shape})"
+
+    def test_batch_dims_and_dispatch(self, seed):
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        x = torch.randn(2, 3, 512, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+        qt_w = QuantizedTensor.from_float(w, "TensorWiseINT4Layout", convrot=True)
+        out = torch.nn.functional.linear(x, qt_w)
+        assert out.shape == (2, 3, 256)
+        ref = x.float() @ w.float().transpose(0, 1)
+        rel = (out.float() - ref).norm() / ref.norm()
+        assert rel.item() < 0.3
+
+
 class TestTensorWiseINT4Layout:
     """Tests for the TensorWiseINT4Layout quantized tensor format."""
 

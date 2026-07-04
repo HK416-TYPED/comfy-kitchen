@@ -140,6 +140,18 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    // int4_tensorwise W4A4 — see ops/int4_tensorwise.cu
+    void launch_int4_tensorwise_quantize_kernel(
+        const void* x,
+        void* q,
+        void* ascales,
+        int64_t M,
+        int64_t M_pad,
+        int64_t K,
+        int input_dtype_code,
+        bool rotate,
+        cudaStream_t stream);
+
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
         const void* x,
@@ -601,6 +613,24 @@ static int svdquant_dtype_code(const nb::dlpack::dtype& dt) {
     int c = map_dtype_to_code(dt);
     if (c < 0) throw std::runtime_error("svdquant: unsupported dtype");
     return c;
+}
+
+void int4_tensorwise_quantize(
+    nb::ndarray<nb::device::cuda> x,           // (M, K) bf16/fp16
+    nb::ndarray<nb::device::cuda> q_x,         // (M_pad, K/2) int8
+    nb::ndarray<nb::device::cuda> ascales,     // (K/64, M_pad) same dtype as x
+    bool rotate,
+    uintptr_t stream_ptr)
+{
+    int64_t M = static_cast<int64_t>(x.shape(0));
+    int64_t K = static_cast<int64_t>(x.shape(1));
+    int64_t M_pad = static_cast<int64_t>(q_x.shape(0));
+    int input_code = svdquant_dtype_code(x.dtype());
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_int4_tensorwise_quantize_kernel(
+        x.data(), q_x.data(), ascales.data(),
+        M, M_pad, K, input_code, rotate, stream);
 }
 
 void svdquant_quantize_w4a4(
@@ -1588,6 +1618,16 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("block_scales"),
           nb::arg("pad_32x") = false,
+          nb::arg("stream_ptr"));
+
+    m.def("int4_tensorwise_quantize", &int4_tensorwise_quantize,
+          "int4_tensorwise W4A4: optional fused ConvRot (group-256 FHT) + per-row "
+          "symmetric int4 quantize (absmax/7, [-7,7]) packed low-nibble-first; "
+          "per-row scale broadcast into the (K/64, M_pad) svdquant ascales layout.",
+          nb::arg("x"),
+          nb::arg("q_x"),
+          nb::arg("ascales"),
+          nb::arg("rotate"),
           nb::arg("stream_ptr"));
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
