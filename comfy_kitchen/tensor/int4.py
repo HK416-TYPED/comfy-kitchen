@@ -56,11 +56,12 @@ class TensorWiseINT4Layout(QuantizedLayout):
     SM 7.5-8.9; newer architectures execute the same math via the INT8 pipeline.
 
     Note:
-        Requires SM >= 7.5 (Turing) like the INT8 layout; there is no additional
-        upper gate — correctness is preserved everywhere, speed varies by arch.
+        Requires SM >= 8.0: the fused CUDA path is built on cp.async, which
+        Turing lacks. Native INT4 tensor cores exist on SM 7.5-8.9; SM >= 9.0
+        executes the same math via the INT8 pipeline (correct, int8-class speed).
     """
 
-    MIN_SM_VERSION = (7, 5)
+    MIN_SM_VERSION = (8, 0)
 
     @dataclass(frozen=True)
     class Params(BaseLayoutParams):

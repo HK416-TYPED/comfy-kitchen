@@ -1518,8 +1518,12 @@ def int4_linear(
         if _INT4_TENSORWISE_QUANT_MEMO_ENABLED:
             _INT4_TENSORWISE_QUANT_MEMO[0] = (x, memo_tag, q_x, ascales, m, m_pad)
 
+    # The GEMM launcher reinterprets both scale buffers as out_dtype, so keep
+    # them in that lane (the quantize kernel writes ascales in x.dtype).
+    if ascales.dtype != out_dtype:
+        ascales = ascales.to(out_dtype)
     # Rank-1 GEMM path reads only the first wscales row: no per-group broadcast.
-    wscales = weight_scale.reshape(1, n).to(device=weight.device, dtype=x.dtype).contiguous()
+    wscales = weight_scale.reshape(1, n).to(device=weight.device, dtype=out_dtype).contiguous()
 
     lkey = (x.device.index, out_dtype, n)
     lora = _INT4_TENSORWISE_EMPTY_LORA_CACHE.get(lkey)

@@ -214,6 +214,19 @@ class TestInt4LinearCudaParity:
         rel = (y_cuda - y_ref).norm() / y_ref.norm().clamp(min=1e-9)
         assert rel.item() < 0.02, f"cuda/eager divergence {rel:.5f} (convrot={convrot}, {shape})"
 
+    def test_out_dtype_mismatch_matches_eager(self, seed):
+        # The GEMM reads ascales/wscales as out_dtype; a bf16 activation with
+        # fp16 output must not misread the scale bytes.
+        from comfy_kitchen.backends.cuda import int4_linear as cuda_int4_linear
+
+        x = torch.randn(37, 3072, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(1024, 3072, dtype=torch.bfloat16, device="cuda")
+        wq, ws = quantize_int4_convrot_weight(w, 256)
+        y_ref = int4_linear(x, wq, ws, None, torch.float16, True, 256).float()
+        y_cuda = cuda_int4_linear(x, wq, ws, None, torch.float16, True, 256).float()
+        rel = (y_cuda - y_ref).norm() / y_ref.norm().clamp(min=1e-9)
+        assert rel.item() < 0.02, f"out-dtype-mismatch divergence {rel:.5f}"
+
     def test_batch_dims_and_dispatch(self, seed):
         from comfy_kitchen.tensor import QuantizedTensor
 
