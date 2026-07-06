@@ -1292,6 +1292,9 @@ def dequantize_int4_convrot_weight_dtype(
     return dequantize_int4_convrot_weight(q, scale, group_size).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
+_int4_eager_cuda_warned = False
+
+
 def int4_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1322,6 +1325,30 @@ def int4_linear(
     Returns:
         Result tensor [..., N].
     """
+    global _int4_eager_cuda_warned
+    if x.is_cuda and not _int4_eager_cuda_warned:
+        _int4_eager_cuda_warned = True
+        import logging
+        try:
+            from comfy_kitchen.backends.cuda import _C as _CUDA_EXT
+            _has_kernels = hasattr(_CUDA_EXT, "int4_tensorwise_quantize")
+        except Exception:
+            _has_kernels = False
+        if _has_kernels:
+            reason = (
+                "the compiled kernels are present but this call does not meet the "
+                "fused path's constraints (SM >= 8.0, K % 64 == 0)"
+            )
+        else:
+            reason = (
+                "the compiled comfy_kitchen CUDA extension with the int4 kernels was "
+                "not found — build it from this checkout "
+                "(python setup.py build_ext --inplace) or install a wheel that ships it"
+            )
+        logging.warning(
+            "int4_tensorwise is running on the SLOW eager reference path on a CUDA "
+            "device (roughly 4x slower than the int8 kernels): %s.", reason
+        )
     w_codes = _int4_unpack_rowwise(weight.to(device=x.device).contiguous())
     if x.shape[-1] != w_codes.shape[-1]:
         raise ValueError(
