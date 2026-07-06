@@ -227,7 +227,8 @@ template<
     bool kRankOne,
     int kMUnrollT = kMUnroll,
     int kWarpsMT = kWarpsM,
-    int kStagesT = kStages>
+    int kStagesT = kStages,
+    int kGroupsPerStageT = 1>
 __global__ void svdquant_scaled_mm_w4a4_kernel(
     const int8_t* __restrict__ act,          // (M, K/2)
     const int8_t* __restrict__ wgt,          // (N, K/2)
@@ -253,18 +254,43 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     constexpr int kNumWarps = kWarpsM * kWarpsN;
     constexpr int kThreadsPerBlock = kNumWarps * 32;
     constexpr int kStages = kStagesT;
-    constexpr int kBLoadSweeps = (kBlockN * 2 + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    constexpr int kALoadSweeps = (kBlockM * 2 + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    // Rank-one loads fragments with ldmatrix; a 48-byte smem row stride staggers the
-    // 8 row addresses of each ldmatrix phase across distinct bank groups (32-byte
+    // Rank-one may pack several 64-value K groups into one pipeline stage: fewer
+    // block-wide barriers per K and longer cp.async bursts. Non-rank-one keeps 1.
+    constexpr int kGroupsPerStage = kRankOne ? kGroupsPerStageT : 1;
+    constexpr int kBLoadSweeps =
+        (kBlockN * 2 * kGroupsPerStage + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    constexpr int kALoadSweeps =
+        (kBlockM * 2 * kGroupsPerStage + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    // Rank-one loads fragments with ldmatrix; a 16-byte row pad staggers the 8 row
+    // addresses of each ldmatrix phase across distinct bank groups (a padless
     // stride would alias rows r and r+4). Non-rank-one keeps the packed 32B stride.
-    constexpr int kSmemRowBytes = kRankOne ? (kBlockKBytes + 16) : kBlockKBytes;
+    constexpr int kSmemRowBytes =
+        kRankOne ? (kGroupsPerStage * kBlockKBytes + 16) : kBlockKBytes;
     static_assert((kWarpsM & (kWarpsM - 1)) == 0, "kWarpsM must be a power of two");
 
     // CTA coordinates
-    const int cta_m = blockIdx.y * kBlockM;
-    const int cta_n = blockIdx.x * kBlockN;
-    const int cta_n_tile = blockIdx.x;
+    // Rank-one: serpentine CTA raster. The default raster runs a full wave of
+    // concurrent CTAs down one M-row of N-tiles, so for wide weights (N*K/2
+    // beyond L2) every wave restreams the whole B strip from DRAM. Remapping a
+    // strip of kRasterGroupM M-tiles to run M-fastest keeps the wave's working
+    // set (a few MB of A+B) L2-resident and divides B DRAM traffic by the
+    // group height. Pure index remap — every (m, n) tile is still covered.
+    int cta_m_idx = blockIdx.y;
+    int cta_n_idx = blockIdx.x;
+    if constexpr (kRankOne) {
+        constexpr int kRasterGroupM = 8;
+        const int num_n_tiles = gridDim.x;
+        const int lin = blockIdx.y * num_n_tiles + blockIdx.x;
+        const int strip = lin / (kRasterGroupM * num_n_tiles);
+        const int rem_m = static_cast<int>(gridDim.y) - strip * kRasterGroupM;
+        const int h = rem_m < kRasterGroupM ? rem_m : kRasterGroupM;
+        const int in_strip = lin - strip * (kRasterGroupM * num_n_tiles);
+        cta_m_idx = strip * kRasterGroupM + in_strip % h;
+        cta_n_idx = in_strip / h;
+    }
+    const int cta_m = cta_m_idx * kBlockM;
+    const int cta_n = cta_n_idx * kBlockN;
+    const int cta_n_tile = cta_n_idx;
 
     // Warp layout within CTA
     const int warp_id   = threadIdx.x >> 5;          // 0..kNumWarps-1
@@ -343,19 +369,21 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     __shared__ alignas(16) OutType smem_LoraB[kFuseLora ? (kBlockN * kLoraRankTile) : 1];
 
     // ---------- Helper: issue async cp for B tile at group `g` into stage ----------
-    auto issue_B_load = [&](int g, int stage) {
-        if (g >= num_groups) return;
+    auto issue_B_load = [&](int g_base, int stage) {
+        if (g_base >= num_groups) return;
         const int thread_idx = threadIdx.x;
         #pragma unroll
         for (int sweep = 0; sweep < kBLoadSweeps; ++sweep) {
             const int t = thread_idx + sweep * kThreadsPerBlock;
-            // each t loads one 16-byte chunk: n_row = t/2, half = t%2
-            if (t < kBlockN * 2) {
-                const int n_row = t >> 1;
-                const int half  = t & 1;
+            // each t loads one 16-byte chunk of one K group of the stage
+            if (t < kBlockN * 2 * kGroupsPerStage) {
+                const int n_row = t / (2 * kGroupsPerStage);
+                const int j     = t % (2 * kGroupsPerStage);
+                const int g     = g_base + (j >> 1);
+                const int half  = j & 1;
                 const int n_global = cta_n + n_row;
-                int8_t* dst = &smem_B[stage][n_row * kSmemRowBytes + half * 16];
-                if (n_global < N) {
+                int8_t* dst = &smem_B[stage][n_row * kSmemRowBytes + j * 16];
+                if (n_global < N && g < num_groups) {
                     const int8_t* src;
                     if constexpr (kTilePacked) {
                         const int n_quad = n_row >> 2;
@@ -376,17 +404,19 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
         }
     };
 
-    auto load_B_fragment = [&](int stage, int c, uint32_t (&b_reg)[2]) {
+    auto load_B_fragment = [&](int stage, int c, int jchunk, uint32_t (&b_reg)[2]) {
         if constexpr (kRankOne) {
             // ldmatrix.x2: lanes 0..15 address the 8 n-rows x two 16B k-chunks of
             // this N-chunk's tile (staging zero-pads OOB rows, so no guard needed).
             const int r = lane & 7;
             const int h = (lane >> 3) & 1;
             const int row_local = (warp_n * kWarpN) + c * 8 + r;
-            const int8_t* addr = &smem_B[stage][row_local * kSmemRowBytes + h * 16];
+            const int8_t* addr = &smem_B[stage][row_local * kSmemRowBytes +
+                                                jchunk * kBlockKBytes + h * 16];
             ldmatrix_x2(b_reg, cvta_smem_u32(addr));
             return;
         }
+        (void)jchunk;
         const int b_col_local = (warp_n * kWarpN) + c * 8 + groupID;
         const int b_col_global = cta_n + b_col_local;
         b_reg[0] = b_reg[1] = 0;
@@ -399,17 +429,19 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     };
 
     // ---------- Helper: issue async cp for A tile at group `g` into stage ----------
-    auto issue_A_load = [&](int g, int stage) {
-        if (g >= num_groups) return;
+    auto issue_A_load = [&](int g_base, int stage) {
+        if (g_base >= num_groups) return;
         #pragma unroll
         for (int sweep = 0; sweep < kALoadSweeps; ++sweep) {
             const int t = threadIdx.x + sweep * kThreadsPerBlock;
-            if (t < kBlockM * 2) {
-                const int m_row = t >> 1;
-                const int half  = t & 1;
+            if (t < kBlockM * 2 * kGroupsPerStage) {
+                const int m_row = t / (2 * kGroupsPerStage);
+                const int j     = t % (2 * kGroupsPerStage);
+                const int g     = g_base + (j >> 1);
+                const int half  = j & 1;
                 const int m_global = cta_m + m_row;
-                int8_t* dst = &smem_A[stage][m_row * kSmemRowBytes + half * 16];
-                if (m_global < M) {
+                int8_t* dst = &smem_A[stage][m_row * kSmemRowBytes + j * 16];
+                if (m_global < M && g < num_groups) {
                     const int8_t* src = act + m_global * K_half + g * kBlockKBytes + half * 16;
                     cp_async_16b(dst, src);
                 } else {
@@ -452,29 +484,37 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
 
     // ---------- Prime the pipeline: launch first (kStages-1) loads ----------
     #pragma unroll
+    const int num_steps = (num_groups + kGroupsPerStage - 1) / kGroupsPerStage;
     for (int s = 0; s < kStages - 1; ++s) {
-        issue_A_load(s, s);
-        issue_B_load(s, s);
+        issue_A_load(s * kGroupsPerStage, s);
+        issue_B_load(s * kGroupsPerStage, s);
         issue_WS_load(s, s);
         cp_async_commit_group();
     }
 
-    for (int g = 0; g < num_groups; ++g) {
-        // Start next iteration's load (stage = (g + kStages - 1) % kStages)
-        const int next_g = g + kStages - 1;
-        if (next_g < num_groups) {
-            const int next_stage = (g + kStages - 1) % kStages;
-            issue_A_load(next_g, next_stage);
-            issue_B_load(next_g, next_stage);
-            issue_WS_load(next_g, next_stage);
+    for (int g_step = 0; g_step < num_steps; ++g_step) {
+        // Wait for the current step's stage, and barrier BEFORE issuing the next
+        // prefetch: the next load overwrites the stage read by the previous step,
+        // so every warp must be past those reads first (WAR hazard otherwise —
+        // async copies can land while a straggler warp is still on its MMAs).
+        cp_async_wait_group<kStages - 2>();
+        __syncthreads();
+
+        const int next_step = g_step + kStages - 1;
+        if (next_step < num_steps) {
+            const int next_stage = next_step % kStages;
+            issue_A_load(next_step * kGroupsPerStage, next_stage);
+            issue_B_load(next_step * kGroupsPerStage, next_stage);
+            issue_WS_load(next_step, next_stage);
         }
         cp_async_commit_group();
 
-        // Wait for the load corresponding to current g (stages ahead of current)
-        cp_async_wait_group<kStages - 1>();
-        __syncthreads();
+        const int cur_stage = g_step % kStages;
 
-        const int cur_stage = g % kStages;
+        #pragma unroll
+        for (int j = 0; j < kGroupsPerStage; ++j) {
+        const int g = g_step * kGroupsPerStage + j;
+        if (g >= num_groups) break;
 
         // ---------- A loads from shmem for each of kMUnroll M-tiles ----------
         uint32_t a_reg[kMUnroll][4];
@@ -487,8 +527,8 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                 // Both operands use the same ldmatrix k-permutation, so the MMA
                 // dot product is unchanged; staging zero-pads rows >= M.
                 const int row_local = warp_m * kWarpM + mi * 16 + (lane & 15);
-                const int8_t* addr =
-                    &smem_A[cur_stage][row_local * kSmemRowBytes + ((lane >> 4) & 1) * 16];
+                const int8_t* addr = &smem_A[cur_stage][row_local * kSmemRowBytes +
+                                                        j * kBlockKBytes + ((lane >> 4) & 1) * 16];
                 ldmatrix_x4(a_reg[mi], cvta_smem_u32(addr));
                 continue;
             }
@@ -561,7 +601,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
         #pragma unroll
         for (int c = 0; c < kNUnroll; ++c) {
             uint32_t b_reg[2];
-            load_B_fragment(cur_stage, c, b_reg);
+            load_B_fragment(cur_stage, c, j, b_reg);
 
             const float ws_col0 = ws_regs[c][0];
             const float ws_col1 = ws_regs[c][1];
@@ -607,6 +647,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                     out_f[mi][c][3] += static_cast<float>(d_reg[3]) * as_row1_arr[mi] * ws_col1;
                 }
             }
+        }
         }
     }
     cp_async_wait_group<0>();  // drain pipeline
@@ -802,18 +843,22 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
         // 2: 64M/8w/3st, 3: 96M/8w/3st); default 0. Register-file trade: kMUnroll=4
         // costs 128 regs -> 2 CTAs/SM (33% occupancy); smaller M-tiles raise
         // occupancy at the price of more (L2-resident) B rereads.
-        int r1_config = 0;
+        // Auto-dispatch: the 2-stage/2-groups-per-stage pipeline (config 4) wins
+        // on large reduction/output tiles (+13..22% on L4: fewer block barriers
+        // per K, longer cp.async bursts); the short 3-stage pipeline (config 0)
+        // stays ahead on small tiles where stage-fill latency dominates.
+        int r1_config = ((int64_t)N * K >= (int64_t)16 * 1024 * 1024) ? 4 : 0;
         if (const char* cfg = std::getenv("COMFY_KITCHEN_INT4_R1_CONFIG")) {
             r1_config = std::atoi(cfg);
         }
-        #define LAUNCH_GEMM_R1(OutType, MU, WM, ST)                                         \
+        #define LAUNCH_GEMM_R1(OutType, MU, WM, ST, GPS)                                    \
             do {                                                                            \
                 constexpr int kBlockM_R1 = (MU) * 16 * (WM);                                \
                 const dim3 grid_r1((N + kBlockN - 1) / kBlockN,                             \
                                    (M + kBlockM_R1 - 1) / kBlockM_R1);                      \
                 const dim3 block_r1((WM) * kWarpsN * 32);                                   \
                 svdquant_scaled_mm_w4a4_kernel<OutType, false, false, false, false, false,  \
-                                               true, (MU), (WM), (ST)>                      \
+                                               true, (MU), (WM), (ST), (GPS)>               \
                     <<<grid_r1, block_r1, 0, stream>>>(                                     \
                     reinterpret_cast<const int8_t*>(act),                                   \
                     reinterpret_cast<const int8_t*>(wgt),                                   \
@@ -828,10 +873,12 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
         #define DISPATCH_R1(OutType)                                                        \
             do {                                                                            \
                 switch (r1_config) {                                                        \
-                    case 1:  LAUNCH_GEMM_R1(OutType, 4, 2, 4); break;                       \
-                    case 2:  LAUNCH_GEMM_R1(OutType, 2, 2, 3); break;                       \
-                    case 3:  LAUNCH_GEMM_R1(OutType, 3, 2, 3); break;                       \
-                    default: LAUNCH_GEMM_R1(OutType, 4, 2, 3); break;                       \
+                    case 1:  LAUNCH_GEMM_R1(OutType, 4, 2, 4, 1); break;                    \
+                    case 2:  LAUNCH_GEMM_R1(OutType, 2, 2, 3, 1); break;                    \
+                    case 3:  LAUNCH_GEMM_R1(OutType, 3, 2, 3, 1); break;                    \
+                    case 4:  LAUNCH_GEMM_R1(OutType, 4, 2, 2, 2); break;                    \
+                    case 5:  LAUNCH_GEMM_R1(OutType, 3, 2, 2, 2); break;                    \
+                    default: LAUNCH_GEMM_R1(OutType, 4, 2, 3, 1); break;                    \
                 }                                                                           \
             } while (0)
         if (out_dtype_code == 2 /* bf16 */) {
